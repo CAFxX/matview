@@ -469,6 +469,7 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
                     "tstz4": ColumnDef(name="tstz4", data_type="TIMESTAMP(4) WITH TIME ZONE"),
                     "tm3": ColumnDef(name="tm3", data_type="TIME(3)"),
                     "tmtz3": ColumnDef(name="tmtz3", data_type="TIME(3) WITH TIME ZONE"),
+                    "tmtz4": ColumnDef(name="tmtz4", data_type="TIME(4) WITH TIME ZONE"),
                     "iv3": ColumnDef(name="iv3", data_type="INTERVAL DAY TO SECOND(3)"),
                     "iv_lbl": ColumnDef(name="iv_lbl", data_type="interval_label"),
                 },
@@ -480,11 +481,10 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
             "CREATE VIEW v_pg_sa AS SELECT id, "
             "CASE WHEN g = 1 THEN tstz3 ELSE tstz3 END AS c_tstz, "
             "CASE WHEN g = 1 THEN tmtz3 ELSE tmtz3 END AS c_tmtz, "
-            "COALESCE(ts3, tstz3) AS co_ts, "
-            "COALESCE(tm3, tmtz3) AS co_tm, "
+            "COALESCE(tstz3, tstz4) AS co_ts, "
+            "COALESCE(tmtz3, tmtz4) AS co_tm, "
             "NULLIF(tstz3, tstz4) AS nf_tstz, "
-            "GREATEST(ts3, tstz3) AS gr_ts, "
-            "ARRAY[ts3, tstz3] AS arr_ts, "
+            "GREATEST(tstz3, tstz4) AS gr_ts, "
             "ARRAY[tstz3, tstz4] AS arr_tstz, "
             "-iv3 AS neg_iv, "
             "iv3 + iv3 AS add_iv, "
@@ -498,11 +498,24 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
         self.assertIn("co_tm TIME WITH TIME ZONE", pg_proj.backing_table_ddl)
         self.assertIn("nf_tstz TIMESTAMP WITH TIME ZONE", pg_proj.backing_table_ddl)
         self.assertIn("gr_ts TIMESTAMP WITH TIME ZONE", pg_proj.backing_table_ddl)
-        self.assertIn("arr_ts TIMESTAMP WITH TIME ZONE[]", pg_proj.backing_table_ddl)
         self.assertIn("arr_tstz TIMESTAMP WITH TIME ZONE[]", pg_proj.backing_table_ddl)
         self.assertIn("neg_iv INTERVAL", pg_proj.backing_table_ddl)
         self.assertIn("add_iv INTERVAL", pg_proj.backing_table_ddl)
         self.assertIn("sub_iv INTERVAL", pg_proj.backing_table_ddl)
+        # Mixing timezone-naive and timezone-aware columns relies on PostgreSQL's
+        # STABLE session-TimeZone coercion and must be refused.
+        for bad_mix in (
+            "COALESCE(ts3, tstz3)",
+            "COALESCE(tm3, tmtz3)",
+            "GREATEST(ts3, tstz3)",
+            "ARRAY[ts3, tstz3]",
+        ):
+            with self.assertRaises(UnsupportedMaterializedViewError, msg=bad_mix):
+                generate_materialized_view(
+                    pg_sa_schemas,
+                    f"CREATE VIEW v_pg_mix AS SELECT id, {bad_mix} AS x FROM t_pg;",
+                    dialect="postgres:18",
+                )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", MatviewDiagnosticWarning)
             pg_poly = generate_materialized_view(
@@ -1464,9 +1477,9 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
 
         pg_schema = (
             "CREATE TABLE a (id INT PRIMARY KEY, k SMALLINT NOT NULL, x SMALLINT, d NUMERIC(6, 2), s VARCHAR(5), "
-            "tm TIME, arr SMALLINT[], b BIT(2), n NAME);"
+            "tm TIMETZ(2), tm_notz TIME, arr SMALLINT[], b BIT(2), n NAME);"
             "CREATE TABLE b (id INT PRIMARY KEY, k BIGINT NOT NULL, y BIGINT, f DOUBLE PRECISION, d NUMERIC(12, 4), "
-            "s VARCHAR(50), tm TIMETZ, arr BIGINT[], b BIT(8), tx TEXT);"
+            "s VARCHAR(50), tm TIMETZ(4), arr BIGINT[], b BIT(8), tx TEXT);"
         )
         p_uall = generate_materialized_view(
             pg_schema,
@@ -1479,6 +1492,12 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
         self.assertRegex(p_uall.backing_table_ddl, r"\btm TIMETZ\b")
         self.assertRegex(p_uall.backing_table_ddl, r"\barr BIGINT\[\]")
         self.assertRegex(p_uall.backing_table_ddl, r'\bb pg_catalog\."bit"(?=[,\s\)])')
+        with self.assertRaises(UnsupportedMaterializedViewError):
+            generate_materialized_view(
+                pg_schema,
+                "CREATE VIEW v_u_tz_mix AS SELECT id, tm_notz AS tm FROM a UNION ALL SELECT id, tm FROM b;",
+                dialect="postgres:18",
+            )
 
         # Positional alignment with differing branch column names (a.x vs b.y),
         # MIN/MAX typmod dropping, BIT_XOR, AVG, compound expressions, and large literals.
@@ -1713,7 +1732,8 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             "  ai2 SMALLINT[], ai2_2d SMALLINT[][], ai4 INT[], "
             "  avc5 VARCHAR(5)[], ach4 CHAR(4)[], atxt TEXT[], at_c TEXT[] COLLATE \"C\", "
             "  ab4 BIT(4)[], avb VARBIT(8)[], "
-            "  ad DATE[], ats2 TIMESTAMP(2) WITHOUT TIME ZONE[], atm2 TIME(2) WITHOUT TIME ZONE[], "
+            "  ad DATE[], ats2 TIMESTAMP(2) WITH TIME ZONE[], atm2 TIME(2) WITH TIME ZONE[], "
+            "  ats2_notz TIMESTAMP(2) WITHOUT TIME ZONE[], "
             "  aiv2 INTERVAL(2)[], acidr CIDR[], "
             "  vc5 VARCHAR(5), ch4 CHAR(4), txt TEXT, t_c TEXT COLLATE \"C\", "
             "  b4 BIT(4), vb VARBIT(8), d DATE, ts2 TIMESTAMP(2) WITHOUT TIME ZONE, "
@@ -1842,7 +1862,8 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
         # 4. Tier 3 SELECT * UNION widens positionally across branches.
         star_schema = (
             "CREATE TABLE s1 (id INT PRIMARY KEY, arr SMALLINT[][], dt DATE);"
-            "CREATE TABLE s2 (id INT PRIMARY KEY, arr BIGINT[], dt TIMESTAMPTZ);"
+            "CREATE TABLE s2 (id INT PRIMARY KEY, arr BIGINT[], dt TIMESTAMP);"
+            "CREATE TABLE s3 (id INT PRIMARY KEY, arr BIGINT[], dt TIMESTAMPTZ);"
         )
         p_star = generate_materialized_view(
             star_schema,
@@ -1850,7 +1871,21 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             dialect="postgres:18",
         )
         self.assertRegex(p_star.backing_table_ddl, r"\barr BIGINT\[\]")
-        self.assertRegex(p_star.backing_table_ddl, r"\bdt TIMESTAMPTZ\b")
+        self.assertRegex(p_star.backing_table_ddl, r"\bdt TIMESTAMP\b")
+        # Mixing DATE and TIMESTAMPTZ (or TIMESTAMP[] and TIMESTAMPTZ[]) across
+        # set-operation arms performs PostgreSQL's STABLE session-TimeZone coercion.
+        with self.assertRaises(UnsupportedMaterializedViewError):
+            generate_materialized_view(
+                star_schema,
+                "CREATE VIEW v_star_tz AS SELECT * FROM s1 UNION SELECT * FROM s3;",
+                dialect="postgres:18",
+            )
+        with self.assertRaises(UnsupportedMaterializedViewError):
+            generate_materialized_view(
+                pg_schema,
+                "CREATE VIEW v_arr_tz AS SELECT id, ats2_notz AS a FROM a UNION ALL SELECT id, atstz4 FROM b;",
+                dialect="postgres:18",
+            )
 
         # 5. ARRAY[...] element widening across strings, NAME, temporal, network, and nested arrays.
         p_arr_expr = generate_materialized_view(
@@ -1945,7 +1980,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
             dialect="postgres:18",
         )
         self.assertRegex(p_star_asym.backing_table_ddl, r"\barr BIGINT\[\]")
-        self.assertRegex(p_star_asym.backing_table_ddl, r"\bdt TIMESTAMPTZ\b")
+        self.assertRegex(p_star_asym.backing_table_ddl, r"\bdt TIMESTAMP\b")
 
         #    (e) Explicit COLLATE overrides implicit collation; collatable custom domains keep COLLATE;
         #        BIT + BIT(1) keeps BIT(1); TIMESTAMP(2) + NULL drops typmod.
@@ -2050,8 +2085,8 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 "  ab4 BIT(4)[], "
                 "  avb VARBIT(8)[], "
                 "  ad DATE[], "
-                "  ats2 TIMESTAMP(2) WITHOUT TIME ZONE[], "
-                "  atm2 TIME(2) WITHOUT TIME ZONE[], "
+                "  ats2 TIMESTAMP(2) WITH TIME ZONE[], "
+                "  atm2 TIME(2) WITH TIME ZONE[], "
                 "  aiv2 INTERVAL(2)[], "
                 "  acidr CIDR[], "
                 "  vc5 VARCHAR(5), "
@@ -2097,7 +2132,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 ")"
             )
             cur.execute(f"CREATE TABLE {ts1} (id INT PRIMARY KEY, arr SMALLINT[][], dt DATE)")
-            cur.execute(f"CREATE TABLE {ts2} (id INT PRIMARY KEY, arr BIGINT[], dt TIMESTAMPTZ)")
+            cur.execute(f"CREATE TABLE {ts2} (id INT PRIMARY KEY, arr BIGINT[], dt TIMESTAMP)")
             cur.execute(f'CREATE TABLE {tcol} (id INT PRIMARY KEY, c TEXT COLLATE "C", name NAME, x INT)')
             cur.execute(f"CREATE TABLE {tcol2} (id INT PRIMARY KEY, c TEXT, name VARCHAR(20), y BIGINT)")
 
@@ -2106,7 +2141,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 "  1, 10, ARRAY[1, 2]::smallint[], ARRAY[ARRAY[1, 2]]::smallint[][], ARRAY[1, 2], "
                 "  ARRAY['hi']::varchar(5)[], ARRAY['ab']::char(4)[], ARRAY['t1'], ARRAY['c1'], "
                 "  ARRAY[B'1010'], ARRAY[B'101'], ARRAY[DATE '2026-01-01'], "
-                "  ARRAY[TIMESTAMP '2026-01-01 00:00:00.12'], ARRAY[TIME '12:30:00.12'], "
+                "  ARRAY[TIMESTAMPTZ '2026-01-01 00:00:00.12+00'], ARRAY[TIMETZ '12:30:00.12+00'], "
                 "  ARRAY[INTERVAL '1 hour'], "
                 "  ARRAY['10.0.0.0/8'::cidr], 'ab', 'ab', 't1', 'c1', "
                 "  B'1010', B'101', DATE '2026-01-01', TIMESTAMP '2026-01-01 00:00:00', "
@@ -2115,7 +2150,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 "  2, 20, ARRAY[3, 4]::smallint[], ARRAY[ARRAY[3, 4]]::smallint[][], ARRAY[5, 6], "
                 "  NULL, ARRAY['cd']::char(4)[], ARRAY['t2'], ARRAY['c2'], "
                 "  ARRAY[B'0101'], ARRAY[B'11'], ARRAY[DATE '2026-02-02'], "
-                "  ARRAY[TIMESTAMP '2026-02-02 01:02:03.45'], ARRAY[TIME '08:00:00'], "
+                "  ARRAY[TIMESTAMPTZ '2026-02-02 01:02:03.45+00'], ARRAY[TIMETZ '08:00:00+00'], "
                 "  ARRAY[INTERVAL '2 hours'], "
                 "  ARRAY['172.16.0.0/12'::cidr], 'xy', 'xy', 't2', 'c2', "
                 "  B'0101', B'11', DATE '2026-02-02', TIMESTAMP '2026-02-02 00:00:00', "
@@ -2147,7 +2182,7 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 f"INSERT INTO {ts1} VALUES (1, ARRAY[ARRAY[1, 2]]::smallint[][], DATE '2026-01-01')"
             )
             cur.execute(
-                f"INSERT INTO {ts2} VALUES (2, ARRAY[5000000000]::bigint[], TIMESTAMPTZ '2026-04-04 00:00:00+00')"
+                f"INSERT INTO {ts2} VALUES (2, ARRAY[5000000000]::bigint[], TIMESTAMP '2026-04-04 00:00:00')"
             )
             cur.execute(f"INSERT INTO {tcol} VALUES (1, 'k1', 'n1'::name, 10)")
             cur.execute(f"INSERT INTO {tcol2} VALUES (1, 'k1', 'n1', 5000000000)")
@@ -2369,6 +2404,10 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 # silently mis-converted (16777217 would survive instead of becoming 16777216).
                 f"SELECT x::int AS v FROM {ta} UNION SELECT x::real FROM {ta} UNION SELECT x::float8 FROM {ta}",
                 f"SELECT x::int AS v FROM {ta} UNION ALL SELECT x::real FROM {ta} UNION ALL SELECT x::float8 FROM {ta}",
+                # Mixing timezone-naive DATE/TIMESTAMP/TIME with timezone-aware TIMESTAMPTZ/TIMETZ
+                # performs PostgreSQL's STABLE session-TimeZone coercion and must be refused.
+                f"SELECT d AS dt FROM {ta} UNION SELECT tstz4 FROM {tb}",
+                f"SELECT tm2 AS tm FROM {ta} UNION ALL SELECT tmtz4 FROM {tb}",
             )):
                 bad_mv = f"mv_bad_u_{idx}_{tag}"
                 with self.assertRaises(UnsupportedMaterializedViewError, msg=bad_sel):
@@ -3770,6 +3809,330 @@ class PostgresWholeRowAndSystemColumnRefusalTests(unittest.TestCase):
                     warnings.simplefilter("ignore")
                     plan = generate_materialized_view(pos_schema, f"CREATE VIEW v AS {sel};", dialect="postgres:18")
                 self.assertTrue(plan.backing_table_ddl)
+
+
+class PostgresStableAndSessionDependentExprRefusalTests(unittest.TestCase):
+    """Offline coverage for PostgreSQL STABLE / session-dependent expression refusal."""
+
+    def test_postgres_stable_and_session_dependent_exprs_refused_offline(self) -> None:
+        schema = (
+            "CREATE TABLE t ("
+            "  id INT PRIMARY KEY, g INT, v INT, s TEXT, s_arr TEXT[], "
+            "  ts TIMESTAMPTZ, ts2 TIMESTAMPTZ, ts_no TIMESTAMP, ts_no2 TIMESTAMP, "
+            "  d DATE, d2 DATE, tm TIME, tmtz TIMETZ, iv INTERVAL, iv2 INTERVAL, "
+            "  m MONEY, m_arr MONEY[], ts_arr TIMESTAMPTZ[], d_arr DATE[], v_arr INT[], "
+            "  ts_rng TSTZRANGE, ts_mrng TSTZMULTIRANGE, rc REGCLASS, o OID, "
+            '  "user" INT, "current_role" INT'
+            ");"
+            "CREATE TABLE u ("
+            "  id INT PRIMARY KEY, ts TIMESTAMPTZ, ts_no TIMESTAMP, d DATE, tm TIME, tmtz TIMETZ, s TEXT"
+            ");"
+        )
+        refused = (
+            # Explicit temporal casts depending on TimeZone
+            ("timezone", "SELECT id, CAST(ts AS DATE) AS e FROM t"),
+            ("timezone", "SELECT id, ts::date AS e FROM t"),
+            ("timezone", "SELECT id, date(ts) AS e FROM t"),
+            ("timezone", "SELECT id, pg_catalog.date(ts) AS e FROM t"),
+            ("timezone", "SELECT id, ts::timestamp AS e FROM t"),
+            ("timezone", "SELECT id, ts::timestamp without time zone AS e FROM t"),
+            ("timezone", "SELECT id, timestamp(ts) AS e FROM t"),
+            ("timezone", "SELECT id, ts::time AS e FROM t"),
+            ("timezone", "SELECT id, time(ts) AS e FROM t"),
+            ("timezone", "SELECT id, ts::timetz AS e FROM t"),
+            ("timezone", "SELECT id, timetz(ts) AS e FROM t"),
+            ("timezone", "SELECT id, d::timestamptz AS e FROM t"),
+            ("timezone", "SELECT id, timestamptz(d) AS e FROM t"),
+            ("timezone", "SELECT id, ts_no::timestamptz AS e FROM t"),
+            ("timezone", "SELECT id, tm::timetz AS e FROM t"),
+            # Text formatting casts (TimeZone / DateStyle / IntervalStyle / lc_monetary)
+            ("text", "SELECT id, CAST(ts AS TEXT) AS e FROM t"),
+            ("text", "SELECT id, ts::varchar(50) AS e FROM t"),
+            ("text", "SELECT id, ts::char(30) AS e FROM t"),
+            ("text", "SELECT id, ts::bpchar AS e FROM t"),
+            ("text", "SELECT id, ts::name AS e FROM t"),
+            ("text", "SELECT id, text(ts) AS e FROM t"),
+            ("text", "SELECT id, ts_no::text AS e FROM t"),
+            ("text", "SELECT id, d::text AS e FROM t"),
+            ("text", "SELECT id, iv::text AS e FROM t"),
+            ("text", "SELECT id, m::text AS e FROM t"),
+            ("text", "SELECT id, (ts AT TIME ZONE 'UTC')::text AS e FROM t"),
+            ("text", "SELECT id, ts_arr::text AS e FROM t"),
+            ("text", "SELECT id, ARRAY[ts]::text AS e FROM t"),
+            ("text", "SELECT id, ts_rng::text AS e FROM t"),
+            ("text", "SELECT id, tstzrange(ts, ts2)::text AS e FROM t"),
+            ("text", "SELECT id, ts_mrng::text AS e FROM t"),
+            ("text", "SELECT id, ROW(id, ts)::text AS e FROM t"),
+            ("text", "SELECT id, (id, ts)::text AS e FROM t"),
+            ("text", "SELECT id, ARRAY_AGG(ts ORDER BY id)::text AS e FROM t GROUP BY id"),
+            # Non-literal / ambiguous text parsing casts
+            ("parsing", "SELECT id, s::date AS e FROM t"),
+            ("parsing", "SELECT id, s::timestamp AS e FROM t"),
+            ("parsing", "SELECT id, s::timestamptz AS e FROM t"),
+            ("parsing", "SELECT id, s::time AS e FROM t"),
+            ("parsing", "SELECT id, s::timetz AS e FROM t"),
+            ("parsing", "SELECT id, s::interval AS e FROM t"),
+            ("parsing", "SELECT id, s::money AS e FROM t"),
+            ("parsing", "SELECT id, s::xml AS e FROM t"),
+            ("parsing", "SELECT id, s::regclass AS e FROM t"),
+            ("parsing", "SELECT id, '2024-03-05 20:00:00'::timestamptz AS e FROM t"),
+            ("parsing", "SELECT id, '05/03/2024'::date AS e FROM t"),
+            ("parsing", "SELECT id, 'today'::date AS e FROM t"),
+            ("parsing", "SELECT id, 'now'::timestamptz AS e FROM t"),
+            ("parsing", "SELECT id, ('2024-03-05'::text)::date AS e FROM t"),
+            # Numeric <-> MONEY (lc_monetary)
+            ("lc_monetary", "SELECT id, v::money AS e FROM t"),
+            ("lc_monetary", "SELECT id, m::numeric AS e FROM t"),
+            # Implicit mixed-timezone coercions
+            ("timezone", "SELECT id, COALESCE(ts_no, ts) AS e FROM t"),
+            ("timezone", "SELECT id, COALESCE(d, ts) AS e FROM t"),
+            ("timezone", "SELECT id, COALESCE(tm, tmtz) AS e FROM t"),
+            ("timezone", "SELECT id, NULLIF(ts, ts_no) AS e FROM t"),
+            ("timezone", "SELECT id, GREATEST(ts, ts_no) AS e FROM t"),
+            ("timezone", "SELECT id, LEAST(ts, d) AS e FROM t"),
+            ("timezone", "SELECT id, ARRAY[ts, ts_no] AS e FROM t"),
+            ("timezone", "SELECT id, CASE WHEN g = 1 THEN ts ELSE ts_no END AS e FROM t"),
+            ("timezone", "SELECT id, CASE ts WHEN ts_no THEN 1 ELSE 0 END AS e FROM t"),
+            ("timezone", "SELECT id FROM t WHERE ts = ts_no"),
+            ("timezone", "SELECT id FROM t WHERE ts > d"),
+            ("timezone", "SELECT id FROM t WHERE ts IS DISTINCT FROM ts_no"),
+            ("timezone", "SELECT id FROM t WHERE ts BETWEEN ts_no AND ts_no2"),
+            ("timezone", "SELECT id FROM t WHERE ts IN (ts_no, ts_no2)"),
+            ("timezone", "SELECT id FROM t WHERE ts IN (SELECT ts_no FROM u)"),
+            ("timezone", "SELECT t.id FROM t JOIN u ON t.ts = u.ts_no"),
+            ("timezone", "SELECT id, ts FROM t UNION SELECT id, ts_no FROM u"),
+            ("timezone", "SELECT id, d FROM t UNION ALL SELECT id, ts FROM u"),
+            ("timezone", "SELECT id, tm FROM t INTERSECT SELECT id, tmtz FROM u"),
+            # Temporal / formatting / JSON functions
+            ("date_trunc", "SELECT id, DATE_TRUNC('day', ts) AS e FROM t"),
+            ("date_trunc", "SELECT id, pg_catalog.date_trunc('day', ts) AS e FROM t"),
+            ("extract", "SELECT id, EXTRACT(DAY FROM ts) AS e FROM t"),
+            ("extract", "SELECT id, DATE_PART('day', ts) AS e FROM t"),
+            ("date_part", "SELECT id, pg_catalog.date_part('day', ts) AS e FROM t"),
+            ("to_char", "SELECT id, TO_CHAR(ts, 'YYYY-MM-DD') AS e FROM t"),
+            ("to_char", "SELECT id, TO_CHAR(v, '999') AS e FROM t"),
+            ("to_char", "SELECT id, pg_catalog.to_char(ts, 'YYYY-MM-DD') AS e FROM t"),
+            ("to_date", "SELECT id, TO_DATE(s, 'YYYY-MM-DD') AS e FROM t"),
+            ("to_timestamp", "SELECT id, TO_TIMESTAMP(s, 'YYYY-MM-DD') AS e FROM t"),
+            ("date_add", "SELECT id, DATE_ADD(ts, INTERVAL '1 day') AS e FROM t"),
+            ("date_subtract", "SELECT id, DATE_SUBTRACT(ts, INTERVAL '1 day') AS e FROM t"),
+            ("age", "SELECT id, AGE(ts) AS e FROM t"),
+            ("timezone", "SELECT id, TIMEZONE(ts) AS e FROM t"),
+            ("time zone", "SELECT id, tmtz AT TIME ZONE 'America/New_York' AS e FROM t"),
+            ("timezone", "SELECT id, pg_catalog.timezone('America/New_York', tmtz) AS e FROM t"),
+            ("interval", "SELECT id, ts + INTERVAL '1 day' AS e FROM t"),
+            ("interval", "SELECT id, INTERVAL '1 day' + ts AS e FROM t"),
+            ("interval", "SELECT id, ts - iv AS e FROM t"),
+            ("make_timestamptz", "SELECT id, MAKE_TIMESTAMPTZ(2024, 3, 5, 20, 0, 0) AS e FROM t"),
+            ("generate_series", "SELECT t.id, gs.x FROM t, LATERAL generate_series(t.ts, t.ts2, INTERVAL '1 day') AS gs(x)"),
+            ("session", "SELECT id, CONCAT(ts, '') AS e FROM t"),
+            ("session", "SELECT id, CONCAT_WS(',', id, ts) AS e FROM t"),
+            ("session", "SELECT id, FORMAT('%s', ts) AS e FROM t"),
+            ("session", "SELECT id, ts || '!' AS e FROM t"),
+            ("session", "SELECT id, d || '!' AS e FROM t"),
+            ("session", "SELECT id, TO_JSON(ts) AS e FROM t"),
+            ("session", "SELECT id, TO_JSONB(ts) AS e FROM t"),
+            ("session", "SELECT id, TO_JSONB(iv) AS e FROM t"),
+            ("session", "SELECT id, JSONB_BUILD_OBJECT('t', ts) AS e FROM t"),
+            ("session", "SELECT id, JSONB_BUILD_ARRAY(ts) AS e FROM t"),
+            ("session", "SELECT g, JSON_AGG(ts ORDER BY id) AS e FROM t GROUP BY g"),
+            ("session", "SELECT g, JSONB_AGG(ts ORDER BY id) AS e FROM t GROUP BY g"),
+            ("session", "SELECT g, JSONB_OBJECT_AGG(id, ts) AS e FROM t GROUP BY g"),
+            # Session value / state functions
+            ("session", "SELECT id, CURRENT_USER AS e FROM t"),
+            ("session", "SELECT id, SESSION_USER AS e FROM t"),
+            ("session", "SELECT id, CURRENT_ROLE AS e FROM t"),
+            ("session", "SELECT id, CURRENT_CATALOG AS e FROM t"),
+            ("session", "SELECT id, CURRENT_SCHEMA AS e FROM t"),
+            ("session", "SELECT id, CURRENT_DATABASE() AS e FROM t"),
+            ("session", "SELECT id, LOCALTIMESTAMP AS e FROM t"),
+            ("session", "SELECT id, LOCALTIME AS e FROM t"),
+            ("session", "SELECT id, CURRENT_SETTING('timezone') AS e FROM t"),
+            ("session", "SELECT id, TXID_CURRENT() AS e FROM t"),
+            ("session", "SELECT id, STATEMENT_TIMESTAMP() AS e FROM t"),
+            ("session", "SELECT id, TRANSACTION_TIMESTAMP() AS e FROM t"),
+            # Propagation across clauses, CTEs, derived tables, aggregates, ranges, arrays, UNNEST
+            ("timezone", "SELECT id FROM t WHERE CAST(ts AS DATE) = DATE '2024-03-05'"),
+            ("timezone", "SELECT CAST(ts AS DATE) AS d_out, COUNT(*) AS c FROM t GROUP BY CAST(ts AS DATE)"),
+            ("timezone", "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING MIN(ts)::date > DATE '2024-01-01'"),
+            ("timezone", "SELECT id, ts FROM t ORDER BY ts::date"),
+            ("timezone", "SELECT DISTINCT ON (ts::date) id, ts FROM t ORDER BY ts::date, id"),
+            ("timezone", "WITH c AS (SELECT id, ts FROM t) SELECT id, c.ts::date AS d_out FROM c"),
+            ("timezone", "WITH c(a, b) AS (SELECT id, ts FROM t) SELECT a, b::date AS d_out FROM c"),
+            ("timezone", "SELECT sub.ts::date AS d_out FROM (SELECT id, ts FROM t) AS sub"),
+            ("timezone", "SELECT id, (SELECT u.ts FROM u WHERE u.id = t.id LIMIT 1)::date AS d_out FROM t"),
+            ("timezone", "SELECT id, lower(ts_rng)::date AS d_out FROM t"),
+            ("timezone", "SELECT id, ts_arr[1]::date AS d_out FROM t"),
+            ("timezone", "SELECT t.id, u_el.x::date AS d_out FROM t, UNNEST(t.ts_arr) AS u_el(x)"),
+            ("timezone", "SELECT g, MIN(ts)::date AS d_out FROM t GROUP BY g"),
+            ("timezone", "SELECT id, ((ts_no AT TIME ZONE 'UTC'))::date AS d_out FROM t"),
+            ("timezone", "SELECT id, DATE_TRUNC('day', ts, 'UTC')::date AS d_out FROM t"),
+            # Array casts, preferred-type promotions, string/window/array propagation,
+            # OVERLAPS, ANY/ALL, RANGE INTERVAL window frames, untyped literals, LATERAL VALUES
+            ("text", "SELECT id, ts_arr::text[] AS e FROM t"),
+            ("timezone", "SELECT id, ts_arr::date[] AS e FROM t"),
+            ("timezone", "SELECT id, ARRAY[ts]::date[] AS e FROM t"),
+            ("timezone", "SELECT id, d_arr::timestamptz[] AS e FROM t"),
+            ("parsing", "SELECT id, s_arr::date[] AS e FROM t"),
+            ("lc_monetary", "SELECT id, v_arr::money[] AS e FROM t"),
+            ("lc_monetary", "SELECT id, m_arr::numeric[] AS e FROM t"),
+            ("timezone", "SELECT id, (ts_arr || ts)::date[] AS e FROM t"),
+            ("timezone", "SELECT id, d AT TIME ZONE 'UTC' AS e FROM t"),
+            ("timezone", "SELECT id, tm AT TIME ZONE 'UTC' AS e FROM t"),
+            ("timezone", "SELECT id, tm AT TIME ZONE INTERVAL '2 hours' AS e FROM t"),
+            ("time zone", "SELECT id, tmtz AT TIME ZONE TRIM(s) AS e FROM t"),
+            ("timezone", "SELECT id, DATE_TRUNC('day', d) AS e FROM t"),
+            ("timezone", "SELECT id, DATE_TRUNC('day', d, 'UTC') AS e FROM t"),
+            ("timezone", "SELECT id, DATE_TRUNC('day', ts_no, 'UTC') AS e FROM t"),
+            ("timezone", "SELECT id, DATE_ADD(d, INTERVAL '1 day') AS e FROM t"),
+            ("timezone", "SELECT id, DATE_ADD(d, INTERVAL '1 day', 'UTC') AS e FROM t"),
+            ("timezone", "SELECT id, DATE_ADD(ts_no, INTERVAL '1 day', 'UTC') AS e FROM t"),
+            ("timezone", "SELECT id, DATE_BIN(INTERVAL '1 hour', d, d2) AS e FROM t"),
+            ("timezone", "SELECT id, DATE_BIN(INTERVAL '1 hour', ts_no, ts) AS e FROM t"),
+            ("timezone", "SELECT t.id, gs.x FROM t, LATERAL generate_series(t.d, t.d2, INTERVAL '1 day') AS gs(x)"),
+            ("timezone", "SELECT t.id, gs.x FROM t, LATERAL generate_series(t.ts_no, t.ts_no2, INTERVAL '1 day', 'UTC') AS gs(x)"),
+            ("timezone", "SELECT id, tstzrange(d, d2) AS e FROM t"),
+            ("timezone", "SELECT id, AGE(d, ts) AS e FROM t"),
+            ("timezone", "SELECT id, timestamptz(d, tm) AS e FROM t"),
+            ("overlaps", "SELECT id, (ts, iv) OVERLAPS (ts2, iv2) AS e FROM t"),
+            ("timezone", "SELECT id, (d, d2) OVERLAPS (ts, ts2) AS e FROM t"),
+            ("parsing", "SELECT id, TRIM(s)::date AS e FROM t"),
+            ("parsing", "SELECT id, SUBSTRING(s, 1, 10)::timestamptz AS e FROM t"),
+            ("parsing", "SELECT id, REPLACE(s, '/', '-')::date AS e FROM t"),
+            ("parsing", "SELECT id, LEFT(s, 10)::date AS e FROM t"),
+            ("parsing", "SELECT id, SPLIT_PART(s, ',', 1)::date AS e FROM t"),
+            ("parsing", "SELECT id, BTRIM(s)::date AS e FROM t"),
+            ("timezone", "SELECT id, LAG(ts) OVER (ORDER BY id)::date AS e FROM t"),
+            ("timezone", "SELECT id, FIRST_VALUE(ts) OVER (ORDER BY id)::date AS e FROM t"),
+            ("text", "SELECT id, ARRAY_APPEND(ts_arr, ts)::text AS e FROM t"),
+            ("text", "SELECT id, ARRAY_PREPEND(ts, ts_arr)::text AS e FROM t"),
+            ("text", "SELECT id, ARRAY_CAT(ts_arr, ts_arr)::text AS e FROM t"),
+            ("timezone", "SELECT id, (d + tmtz)::date AS e FROM t"),
+            ("timezone", "SELECT id, (d + tm)::timestamptz AS e FROM t"),
+            ("text", "SELECT id, (d + tm)::text AS e FROM t"),
+            ("text", "SELECT id, CHAR(ts) AS e FROM t"),
+            ("array_to_string", "SELECT id, ARRAY_TO_STRING(ts_arr, ',') AS e FROM t"),
+            ("quote_literal", "SELECT id, QUOTE_LITERAL(ts) AS e FROM t"),
+            ("json", "SELECT id, JSON_OBJECT('a': ts) AS e FROM t"),
+            ("json", "SELECT g, JSON_OBJECTAGG(id: ts) AS e FROM t GROUP BY g"),
+            ("json", "SELECT g, JSON_ARRAYAGG(ts) AS e FROM t GROUP BY g"),
+            ("text", "SELECT id, rc::text AS e FROM t"),
+            ("text", "SELECT id, o::regclass::text AS e FROM t"),
+            ("parsing", "SELECT id, '2024-03-05'::timestamptz AS e FROM t"),
+            ("parsing", "SELECT id, '2024-03-05 20:00:00 UTC'::timestamptz AS e FROM t"),
+            ("parsing", "SELECT id, d FROM t WHERE d = '05/03/2024'"),
+            ("parsing", "SELECT id, ts FROM t WHERE ts = '2024-03-05 20:00:00'"),
+            ("timezone", "SELECT id FROM t WHERE ts = ANY(ARRAY[ts_no])"),
+            ("timezone", "SELECT id FROM t WHERE ts = ANY(SELECT ts_no FROM u)"),
+            ("timezone", "SELECT id FROM t WHERE ts > ALL(SELECT d FROM u)"),
+            ("timezone", "SELECT t.id FROM (t JOIN u ON t.ts = u.ts_no)"),
+            ("timezone", "SELECT t.id, v.x::date AS e FROM t CROSS JOIN LATERAL (VALUES (t.ts)) AS v(x)"),
+            ("range window", "SELECT id, SUM(v) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW) AS e FROM t"),
+            ("session", "SELECT id, user AS e FROM t"),
+        )
+        for expected_kw, sel in refused:
+            with self.subTest(refused=sel):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    with self.assertRaises(UnsupportedMaterializedViewError) as ctx:
+                        generate_materialized_view(schema, f"CREATE VIEW v AS {sel};", dialect="postgres:18")
+                self.assertIn(expected_kw, str(ctx.exception).lower())
+
+        # Positive controls: IMMUTABLE temporal / formatting expressions must stay allowed.
+        allowed = (
+            "SELECT id, ts, ts_no, d, tm, tmtz, iv, m FROM t",
+            "SELECT g, MIN(ts) AS mn_ts, MAX(ts) AS mx_ts, COUNT(*) AS c FROM t GROUP BY g",
+            "SELECT id, ts AT TIME ZONE 'UTC' AS ts_utc FROM t",
+            "SELECT id, CAST(ts AT TIME ZONE 'UTC' AS DATE) AS d_utc FROM t",
+            "SELECT id, (ts AT TIME ZONE 'UTC')::time AS tm_utc FROM t",
+            "SELECT id, DATE_TRUNC('day', ts, 'UTC') AS dt3 FROM t",
+            "SELECT id, DATE_TRUNC('day', ts AT TIME ZONE 'UTC') AS dt_utc FROM t",
+            "SELECT id, DATE_TRUNC('day', ts_no) AS dt_no FROM t",
+            "SELECT id, DATE_TRUNC('hour', iv) AS dt_iv FROM t",
+            "SELECT id, EXTRACT(DAY FROM ts AT TIME ZONE 'UTC') AS ext_utc FROM t",
+            "SELECT id, EXTRACT(DAY FROM d) AS ext_d FROM t",
+            "SELECT id, EXTRACT(HOUR FROM ts_no) AS ext_tsno FROM t",
+            "SELECT id, EXTRACT(HOUR FROM tm) AS ext_tm FROM t",
+            "SELECT id, EXTRACT(HOUR FROM tmtz) AS ext_tmtz FROM t",
+            "SELECT id, EXTRACT(EPOCH FROM iv) AS ext_iv FROM t",
+            "SELECT id, DATE_ADD(ts, INTERVAL '1 day', 'UTC') AS da3 FROM t",
+            "SELECT id, CAST(DATE_SUBTRACT(ts, INTERVAL '1 day', 'UTC') AS TIMESTAMPTZ) AS ds3 FROM t",
+            "SELECT id, DATE_BIN(INTERVAL '1 hour', ts, '2024-01-01 00:00:00+00'::timestamptz) AS db FROM t",
+            "SELECT id, ts - ts2 AS diff_ts FROM t",
+            "SELECT id, ts_no + iv AS add_tsno FROM t",
+            "SELECT id, d + iv AS add_div FROM t",
+            "SELECT id, d + 7 AS add_dint FROM t",
+            "SELECT id, iv + iv2 AS add_iv FROM t",
+            "SELECT id, CAST(AGE(ts, ts2) AS INTERVAL) AS age2 FROM t",
+            "SELECT id, CAST(TIMEZONE('UTC', ts) AS TIMESTAMP) AS tz2 FROM t",
+            "SELECT id, tmtz AT TIME ZONE INTERVAL '2 hours' AS tmtz_iv FROM t",
+            "SELECT id, TO_TIMESTAMP(v) AS ut FROM t",
+            "SELECT id, ts::timestamptz(0) AS ts0 FROM t",
+            "SELECT id, ts_no::date AS tsno_d FROM t",
+            "SELECT id, ts_no::time AS tsno_tm FROM t",
+            "SELECT id, d::timestamp AS d_tsno FROM t",
+            "SELECT id, tmtz::time AS tmtz_tm FROM t",
+            "SELECT id, COALESCE(ts, ts2) AS co_ts FROM t",
+            "SELECT id, COALESCE(d, ts_no) AS co_dts FROM t",
+            "SELECT id, ARRAY[ts, ts2] AS arr_ts FROM t",
+            "SELECT id, ts_arr || ARRAY[ts] AS cat_arr FROM t",
+            "SELECT id, CONCAT(s, 'x') AS cat_s FROM t",
+            "SELECT id, CONCAT_WS(',', s, id::text) AS catws_s FROM t",
+            "SELECT id, FORMAT('%s:%s', s, id) AS fmt_s FROM t",
+            "SELECT id, s || '!' AS dpipe_s FROM t",
+            "SELECT id, ROW(id, v)::text AS row_int_txt FROM t",
+            "SELECT id, TO_JSONB(d)::jsonb AS jb_d, TO_JSONB(ts_no)::jsonb AS jb_tsno, TO_JSONB(v)::jsonb AS jb_v FROM t",
+            "SELECT id, ts FROM t WHERE ts > '2024-03-05 20:00:00+00'::timestamptz AND d >= '2024-03-05'::date",
+            "WITH c AS (SELECT id, ts AT TIME ZONE 'UTC' AS ts_u FROM t) SELECT id, ts_u::date AS d_u FROM c",
+            "SELECT id, d FROM t UNION SELECT id, ts_no FROM u",
+            "SELECT id, ts FROM t UNION SELECT id, ts FROM u",
+            'SELECT id, "user" AS u_col, "current_role" AS cr_col FROM t',
+            "SELECT id, d + tm AS d_tm, d + tmtz AS d_tmtz, d - d2 AS d_diff, d + v AS d_plus FROM t",
+            "SELECT id, (d, d2) OVERLAPS (ts_no, ts_no2) AS ov1, (ts, ts2) OVERLAPS (ts, ts2) AS ov2 FROM t",
+            "SELECT id, ARRAY_TO_STRING(s_arr, ',') AS s_join, CHR(65) AS c_a FROM t",
+        )
+        for sel in allowed:
+            with self.subTest(allowed=sel):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    plan = generate_materialized_view(schema, f"CREATE VIEW v AS {sel};", dialect="postgres:18")
+                self.assertTrue(plan.backing_table_ddl)
+
+        # Verify exact PostgreSQL temporal expression storage-type inference
+        # (never silently falling back to TEXT for short- or long-form spellings).
+        p_types = generate_materialized_view(
+            schema,
+            "CREATE VIEW v_pg_tt AS SELECT id, "
+            "ts AT TIME ZONE 'UTC' AS atz_ts, "
+            "ts_no AT TIME ZONE 'UTC' AS atz_tstz, "
+            "tmtz AT TIME ZONE INTERVAL '2 hours' AS atz_tmtz, "
+            "DATE_TRUNC('day', ts, 'UTC') AS dt_tstz, "
+            "DATE_TRUNC('day', ts_no) AS dt_ts, "
+            "DATE_ADD(ts, iv, 'UTC') AS da_tstz, "
+            "ts - ts2 AS sub_tstz, "
+            "d - d2 AS sub_d, "
+            "d + v AS add_dv, "
+            "d + tm AS add_dtm, "
+            "d + tmtz AS add_dtmtz, "
+            "EXTRACT(DAY FROM d) AS ext_d, "
+            "DATE_PART('day', d) AS dp_d "
+            "FROM t;",
+            dialect="postgres:18",
+        )
+        ddl_tt = p_types.backing_table_ddl
+        self.assertRegex(ddl_tt, r"\batz_ts TIMESTAMP\b")
+        self.assertRegex(ddl_tt, r"\batz_tstz TIMESTAMP WITH TIME ZONE\b")
+        self.assertRegex(ddl_tt, r"\batz_tmtz TIME WITH TIME ZONE\b")
+        self.assertRegex(ddl_tt, r"\bdt_tstz TIMESTAMP WITH TIME ZONE\b")
+        self.assertRegex(ddl_tt, r"\bdt_ts TIMESTAMP\b")
+        self.assertRegex(ddl_tt, r"\bda_tstz TIMESTAMP WITH TIME ZONE\b")
+        self.assertRegex(ddl_tt, r"\bsub_tstz INTERVAL\b")
+        self.assertRegex(ddl_tt, r"\bsub_d INT(?:EGER)?\b")
+        self.assertRegex(ddl_tt, r"\badd_dv DATE\b")
+        self.assertRegex(ddl_tt, r"\badd_dtm TIMESTAMP\b")
+        self.assertRegex(ddl_tt, r"\badd_dtmtz TIMESTAMP WITH TIME ZONE\b")
+        self.assertRegex(ddl_tt, r"\bext_d NUMERIC\b")
+        self.assertRegex(ddl_tt, r"\bdp_d DOUBLE PRECISION\b")
 
 
 if __name__ == "__main__":

@@ -1521,22 +1521,133 @@ def test_pg_window_ties_unread_column_update_matches_live_view(make_env, target:
     env.check("second unread-column update")
 
 
-@known_defect("pre-existing P0: STABLE timestamptz expressions are evaluated with the writer session's TimeZone/DateStyle (TODO.md)")
 @pytest.mark.parametrize("target", _params(("postgres",)))
-@pytest.mark.parametrize("expr", ["CAST(ts AS DATE)", "CAST(ts AS TEXT)"])
-def test_pg_timestamptz_expression_independent_of_writer_session_settings(make_env, target: Target, expr: str) -> None:
-    """The live view is evaluated in the reader's session; the materialized
-    value was computed in the writer's session (TimeZone/DateStyle differ)."""
-    env = make_env(target, views=[], seed=False, schema_sql=["CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMPTZ)"])
-    vd = ViewDef("v_tstz", f"SELECT id, {expr} AS e FROM t", ("postgres",))
-    env.register(vd)
-    env.views.append(vd)
-    w = env.connect()
-    env.execute("SET TimeZone = 'Asia/Tokyo'", w)
-    env.execute("SET DateStyle = 'German'", w)
-    env.execute("INSERT INTO t (id, ts) VALUES (1, '2024-03-05 20:00:00+00')", w)
-    env.commit(w)
-    env.check("insert from a non-UTC, non-ISO session")
+@pytest.mark.parametrize(
+    "view_sql",
+    [
+        "SELECT id, CAST(ts AS DATE) AS e FROM t",
+        "SELECT id, CAST(ts AS TEXT) AS e FROM t",
+        "SELECT id, ts::timestamp AS e FROM t",
+        "SELECT id, ts::time AS e FROM t",
+        "SELECT id, ts::timetz AS e FROM t",
+        "SELECT id, DATE_TRUNC('day', ts) AS e FROM t",
+        "SELECT id, EXTRACT(DAY FROM ts) AS e FROM t",
+        "SELECT id, TO_CHAR(ts, 'YYYY-MM-DD') AS e FROM t",
+        "SELECT id, TO_JSONB(ts) AS e FROM t",
+        "SELECT id, CONCAT(ts, '') AS e FROM t",
+        "SELECT id, ts || '!' AS e FROM t",
+        "SELECT id, ts + INTERVAL '1 day' AS e FROM t",
+        "SELECT id, AGE(ts) AS e FROM t",
+        "SELECT id, COALESCE(ts_no, ts) AS e FROM t",
+        "SELECT id, d::timestamptz AS e FROM t",
+        "SELECT id, d::text AS e FROM t",
+        "SELECT id, s::date AS e FROM t",
+        "SELECT id, CURRENT_SETTING('timezone') AS e FROM t",
+        "SELECT id, CURRENT_USER AS e FROM t",
+        "SELECT id, LOCALTIMESTAMP AS e FROM t",
+        "SELECT id, ARRAY[ts]::text[] AS e FROM t",
+        "SELECT id, d AT TIME ZONE 'UTC' AS e FROM t",
+        "SELECT id, DATE_TRUNC('day', d) AS e FROM t",
+        "SELECT id, SUM(id) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW) AS e FROM t",
+    ],
+)
+def test_pg_timestamptz_expression_independent_of_writer_session_settings(make_env, target: Target, view_sql: str) -> None:
+    """STABLE / session-dependent PostgreSQL expressions must be refused at
+    registration rather than frozen in the writer's TimeZone / DateStyle."""
+    env = make_env(
+        target,
+        views=[],
+        seed=False,
+        schema_sql=["CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMPTZ, ts_no TIMESTAMP, d DATE, s TEXT)"],
+    )
+    vd = ViewDef("v_tstz", view_sql, ("postgres",))
+    with pytest.raises(UnsupportedMaterializedViewError, match=r"(?i)stable|volatile|session-dependent"):
+        env.register(vd)
+    env.conn.rollback()
+
+
+@pytest.mark.parametrize("target", _params(("postgres",)))
+def test_pg_stable_and_volatile_udfs_refused_and_immutable_timestamptz_maintained(make_env, target: Target) -> None:
+    """User-defined STABLE/VOLATILE functions are refused via pg_proc.provolatile,
+    while IMMUTABLE TIMESTAMPTZ expressions stay identical to the live view even
+    when writers use a non-UTC TimeZone and non-ISO DateStyle."""
+    env = make_env(
+        target,
+        views=[],
+        seed=False,
+        schema_sql=["CREATE TABLE t (id INT PRIMARY KEY, g INT, ts TIMESTAMPTZ, ts2 TIMESTAMPTZ)"],
+    )
+    env.execute(
+        "CREATE FUNCTION mv_stable_day(x TIMESTAMPTZ) RETURNS DATE "
+        "LANGUAGE sql STABLE AS $$ SELECT x::date $$"
+    )
+    env.execute(
+        "CREATE FUNCTION mv_volatile_tag(x INT) RETURNS INT "
+        "LANGUAGE sql VOLATILE AS $$ SELECT x + 1 $$"
+    )
+    env.execute(
+        "CREATE FUNCTION lower(x INT) RETURNS INT "
+        "LANGUAGE sql VOLATILE AS $$ SELECT x * 2 $$"
+    )
+    env.commit()
+    try:
+        for bad_sql in (
+            "SELECT id, mv_stable_day(ts) AS d FROM t",
+            "SELECT id, mv_volatile_tag(g) AS v FROM t",
+            "SELECT id FROM t WHERE mv_stable_day(ts) > DATE '2024-01-01'",
+            "SELECT id FROM t WHERE lower(g) > 0",
+        ):
+            with pytest.raises(UnsupportedMaterializedViewError, match=r"(?i)stable|volatile"):
+                env.register(ViewDef("v_bad_udf", bad_sql, ("postgres",)))
+            env.conn.rollback()
+
+        imm_views = [
+            ViewDef(
+                "v_tstz_proj",
+                "SELECT id, ts, "
+                "CAST(ts AT TIME ZONE 'UTC' AS DATE) AS utc_day, "
+                "DATE_TRUNC('day', ts, 'UTC') AS trunc_utc, "
+                "EXTRACT(DAY FROM ts AT TIME ZONE 'UTC') AS utc_dom, "
+                "ts - ts2 AS span, "
+                "COALESCE(ts, ts2) AS co_ts "
+                "FROM t",
+                ("postgres",),
+            ),
+            ViewDef(
+                "v_tstz_agg",
+                "SELECT g, MIN(ts) AS mn_ts, MAX(ts) AS mx_ts, COUNT(*) AS cnt FROM t GROUP BY g",
+                ("postgres",),
+            ),
+        ]
+        for vd in imm_views:
+            env.register(vd)
+            env.views.append(vd)
+
+        w = env.connect()
+        env.execute("SET TimeZone = 'Asia/Tokyo'", w)
+        env.execute("SET DateStyle = 'German'", w)
+        env.execute(
+            "INSERT INTO t (id, g, ts, ts2) VALUES "
+            "(1, 1, '2024-03-05 20:00:00+00', '2024-03-05 18:00:00+00'), "
+            "(2, 1, '2024-03-06 02:30:00+00', '2024-03-05 20:00:00+00')",
+            w,
+        )
+        env.commit(w)
+        env.check("insert from Asia/Tokyo + German writer session")
+
+        env.execute("UPDATE t SET ts = '2024-03-07 23:00:00+00' WHERE id = 1", w)
+        env.commit(w)
+        env.check("update from Asia/Tokyo + German writer session")
+
+        env.execute("DELETE FROM t WHERE id = 2", w)
+        env.commit(w)
+        env.check("delete from Asia/Tokyo + German writer session")
+    finally:
+        env.conn.rollback()
+        env.execute("DROP FUNCTION IF EXISTS mv_stable_day(TIMESTAMPTZ)")
+        env.execute("DROP FUNCTION IF EXISTS mv_volatile_tag(INT)")
+        env.execute("DROP FUNCTION IF EXISTS lower(INT)")
+        env.commit()
 
 
 @pytest.mark.parametrize("target", _params(("postgres",)))

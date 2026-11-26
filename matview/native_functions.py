@@ -561,6 +561,222 @@ def _modelled_function_names(spec: ViewSpec, dialect: Dialect) -> Set[str]:
     return out
 
 
+_PG_CATALOG_TYPE_AWARE_STABLE_EXEMPT = frozenset({
+    "PG_TYPEOF",
+    "CONCAT",
+    "CONCAT_WS",
+    "FORMAT",
+    "TO_JSON",
+    "TO_JSONB",
+    "JSON_BUILD_OBJECT",
+    "JSONB_BUILD_OBJECT",
+    "JSON_BUILD_ARRAY",
+    "JSONB_BUILD_ARRAY",
+    "ROW_TO_JSON",
+    "ARRAY_TO_JSON",
+})
+
+# Handled by planner._detect_limitations() as NONDETERMINISTIC_EXPR
+# (EngineLimitationError) so existing limitation-reporting contracts stay intact.
+_PG_PLANNER_NONDETERMINISTIC_NAMES = frozenset({
+    "RANDOM",
+    "RAND",
+    "UUID",
+    "GEN_RANDOM_UUID",
+    "NOW",
+    "CLOCK_TIMESTAMP",
+    "SYSDATE",
+    "CURRENT_TIMESTAMP",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+})
+
+
+def _all_pg_function_calls(spec: ViewSpec) -> List[FunctionCall]:
+    """Collect every unmodelled (Anonymous) function call across the entire
+    PostgreSQL view query (SELECT, WHERE, JOIN ON, GROUP BY, HAVING, ORDER BY,
+    WINDOW, CTEs, subqueries, and set operations)."""
+    node = _parse(spec.raw_select_sql, Dialect.POSTGRES)
+    if node is None:
+        return []
+    seen: Set[Tuple[str, str, int]] = set()
+    out: List[FunctionCall] = []
+    for anon in node.find_all(sqlglot_exp.Anonymous):
+        name = str(anon.name).upper()
+        if (
+            not name
+            or name in _ROW_VALUE_CONSTRUCTORS
+            or name in _PG_PLANNER_NONDETERMINISTIC_NAMES
+            or name in KNOWN_AGGREGATE_NAMES
+            or name in _FN_TO_AGG_ENUM
+            or name in _STATISTICAL_ALIAS_NAMES
+            or name == "COUNT"
+        ):
+            continue
+        parent = anon.parent
+        schema = (
+            str(parent.this.name)
+            if isinstance(parent, sqlglot_exp.Dot)
+            and parent.expression is anon
+            and isinstance(parent.this, (sqlglot_exp.Identifier, sqlglot_exp.Column))
+            else None
+        )
+        key = (schema or "", name, len(anon.expressions))
+        if key not in seen:
+            seen.add(key)
+            out.append(FunctionCall(name=name, arity=len(anon.expressions), schema=schema))
+    return out
+
+
+def _all_pg_modelled_function_names(spec: ViewSpec) -> Set[str]:
+    """Names of sqlglot-modelled functions across the ENTIRE PostgreSQL query
+    (SELECT, WHERE, JOIN ON, GROUP BY, HAVING, ORDER BY, CTEs, subqueries)."""
+    node = _parse(spec.raw_select_sql, Dialect.POSTGRES)
+    if node is None:
+        return _modelled_function_names(spec, Dialect.POSTGRES)
+    out: Set[str] = set()
+    for f in node.find_all(sqlglot_exp.Func):
+        if isinstance(f, sqlglot_exp.Anonymous):
+            continue
+        head = f.sql(dialect="postgres").split("(", 1)[0].strip().upper()
+        if head and re.fullmatch(r"[A-Z_][A-Z0-9_]*", head):
+            out.add(head)
+        key = getattr(f, "key", "")
+        if key:
+            out.add(str(key).upper())
+    return out
+
+
+def enforce_pg_function_volatility(conn: Any, spec: ViewSpec) -> None:
+    """Refuse PostgreSQL views calling STABLE or VOLATILE scalar functions
+    according to ``pg_catalog.pg_proc.provolatile``.
+
+    Polymorphic ``pg_catalog`` formatting/JSON wrappers (``concat``,
+    ``to_jsonb``, etc.) and ``pg_typeof`` are handled type-accurately by the
+    dialect's static AST validator so immutable argument types (such as
+    ``CONCAT(text_col, 'x')``) remain accepted while session-dependent
+    arguments (such as ``CONCAT(ts, '')`` or ``to_jsonb(ts)``) are refused.
+    User-defined functions outside ``pg_catalog`` (including any shadowing
+    a ``pg_catalog`` name) and all other ``pg_catalog`` functions whose
+    matching overloads are all STABLE or VOLATILE are refused here.
+    """
+    for extra in spec.additional_views:
+        enforce_pg_function_volatility(conn, extra)
+
+    calls = _all_pg_function_calls(spec)
+    modelled_names = {
+        n for n in _all_pg_modelled_function_names(spec)
+        if n not in _PG_PLANNER_NONDETERMINISTIC_NAMES
+        and n not in KNOWN_AGGREGATE_NAMES
+        and n not in _FN_TO_AGG_ENUM
+        and n not in _STATISTICAL_ALIAS_NAMES
+        and n != "COUNT"
+    }
+    if not calls and not modelled_names:
+        return
+
+    all_names = sorted({c.name for c in calls} | modelled_names)
+    savepoint = not getattr(conn, "autocommit", False)
+    sp_name = f"__mv_vol_{uuid.uuid4().hex[:10]}"
+    cur = conn.cursor()
+    try:
+        if savepoint:
+            cur.execute(f"SAVEPOINT {sp_name}")
+        try:
+            cur.execute(
+                "SELECT upper(p.proname), p.prokind, p.pronargs, p.provariadic <> 0, "
+                "p.pronargdefaults, n.nspname, pg_catalog.pg_function_is_visible(p.oid), "
+                "p.provolatile "
+                "FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE upper(p.proname) = ANY(%s)",
+                (all_names,),
+            )
+            rows = [tuple(r) for r in cur.fetchall()]
+        except Exception:
+            if savepoint:
+                try:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                except Exception:
+                    pass
+            return
+        finally:
+            if savepoint:
+                try:
+                    cur.execute(f"RELEASE SAVEPOINT {sp_name}")
+                except Exception:
+                    pass
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+    def _matches_call(r: Tuple[Any, ...], call: FunctionCall) -> bool:
+        if r[0] != call.name or r[1] != "f":
+            return False
+        if call.schema is not None:
+            if r[5] != call.schema and str(r[5]).lower() != call.schema.lower():
+                return False
+        elif not r[6]:
+            return False
+        required = int(r[2]) - int(r[4])
+        return required <= call.arity <= int(r[2]) or (bool(r[3]) and call.arity >= int(r[2]) - 1)
+
+    for call in calls:
+        cands = [r for r in rows if _matches_call(r, call)]
+        if not cands:
+            continue
+        user_cands = [r for r in cands if str(r[5]) != "pg_catalog"]
+        if user_cands:
+            # Any visible/qualified user-defined function overload that is
+            # STABLE or VOLATILE cannot safely be frozen (even if pg_catalog
+            # has an IMMUTABLE overload of the same name and arity).
+            non_imm_user = {str(r[7]) for r in user_cands if str(r[7]) != "i"}
+            if non_imm_user:
+                vol_label = (
+                    "VOLATILE" if non_imm_user == {"v"}
+                    else ("STABLE" if non_imm_user == {"s"} else "STABLE/VOLATILE")
+                )
+                qual = f"{call.schema}.{call.name}" if call.schema else call.name
+                raise UnsupportedMaterializedViewError(
+                    f"View {spec.view_name!r}: PostgreSQL function {qual}/{call.arity} is {vol_label} "
+                    f"(not IMMUTABLE); its result may depend on session settings or execution state and "
+                    f"cannot be frozen in a materialized view."
+                )
+        vols = {str(r[7]) for r in cands}
+        if "i" in vols:
+            continue
+        schemas = {str(r[5]) for r in cands}
+        if schemas == {"pg_catalog"} and call.name in _PG_CATALOG_TYPE_AWARE_STABLE_EXEMPT:
+            continue
+        vol_label = "VOLATILE" if vols == {"v"} else ("STABLE" if vols == {"s"} else "STABLE/VOLATILE")
+        qual = f"{call.schema}.{call.name}" if call.schema else call.name
+        raise UnsupportedMaterializedViewError(
+            f"View {spec.view_name!r}: PostgreSQL function {qual}/{call.arity} is {vol_label} "
+            f"(not IMMUTABLE); its result may depend on session settings or execution state and "
+            f"cannot be frozen in a materialized view."
+        )
+
+    # Also catch user-defined STABLE/VOLATILE functions outside pg_catalog that
+    # shadow any sqlglot-modelled built-in name (e.g. VOLATILE public.lower() or
+    # public.concat()) anywhere in the query.
+    for name in sorted(modelled_names):
+        user_cands = [
+            r for r in rows
+            if r[0] == name and r[1] == "f" and str(r[5]) != "pg_catalog" and bool(r[6])
+        ]
+        if not user_cands:
+            continue
+        non_imm = {str(r[7]) for r in user_cands if str(r[7]) != "i"}
+        if non_imm:
+            vol_label = "VOLATILE" if non_imm == {"v"} else ("STABLE" if non_imm == {"s"} else "STABLE/VOLATILE")
+            raise UnsupportedMaterializedViewError(
+                f"View {spec.view_name!r}: user-defined PostgreSQL function {name} is {vol_label} "
+                f"(not IMMUTABLE); its result may depend on session settings or execution state and "
+                f"cannot be frozen in a materialized view."
+            )
+
+
 def overridden_modelled_functions(conn: Any, spec: ViewSpec, dialect: Dialect) -> List[Tuple[str, str]]:
     """Built-in functions that sqlglot models (min, max, abs, lower, md5, ...)
     for which the engine also has a user-defined function of the same name

@@ -24,6 +24,7 @@ from .compiler import IncrementalViewCompiler
 from .native_functions import (
     apply_catalog_classification,
     classify as classify_native_functions,
+    enforce_pg_function_volatility,
     items_with_unmodelled_calls,
     probe_result_types,
     query_has_unmodelled_call,
@@ -2438,6 +2439,8 @@ class MaterializedViewManager:
             )
         if not isinstance(spec, ViewSpec):
             return view
+        if self.dialect == Dialect.POSTGRES:
+            enforce_pg_function_volatility(self.conn, spec)
         if self.dialect != Dialect.MYSQL:
             overridden = overridden_modelled_functions(self.conn, spec, self.dialect)
             if overridden:
