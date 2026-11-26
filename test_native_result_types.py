@@ -424,6 +424,252 @@ class MySQLPlannedResultTypeTests(unittest.TestCase):
                 )
                 self.assertRegex(plan.backing_table_ddl, r'(?im)^\s*[\x60"]?k[\x60"]?\s+BIGINT\b')
 
+    def test_temporal_precision_introspection_and_expression_types(self) -> None:
+        from unittest import mock
+        from sqlalchemy.dialects import mysql as sa_mysql, postgresql as sa_pg
+
+        from matview.connectivity import _format_sa_column_type, introspect_database_schemas
+
+        # 1. SQLAlchemy type formatting preserves fractional-seconds precision.
+        self.assertEqual(_format_sa_column_type(sa_mysql.TIME(fsp=3), Dialect.MYSQL), "TIME(3)")
+        self.assertEqual(_format_sa_column_type(sa_mysql.TIME(fsp=0), Dialect.MYSQL), "TIME")
+        self.assertEqual(_format_sa_column_type(sa_mysql.TIME(), Dialect.MYSQL), "TIME")
+        self.assertEqual(_format_sa_column_type(sa_mysql.DATETIME(fsp=6), Dialect.MYSQL), "DATETIME(6)")
+        self.assertEqual(_format_sa_column_type(sa_mysql.TIMESTAMP(fsp=4), Dialect.MYSQL), "TIMESTAMP(4)")
+        self.assertEqual(_format_sa_column_type(sa_pg.TIME(precision=3), Dialect.POSTGRES), "TIME(3)")
+        self.assertEqual(_format_sa_column_type(sa_pg.TIMESTAMP(precision=0), Dialect.POSTGRES), "TIMESTAMP(0)")
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.TIMESTAMP(timezone=True, precision=3), Dialect.POSTGRES),
+            "TIMESTAMP(3) WITH TIME ZONE",
+        )
+        self.assertEqual(_format_sa_column_type(sa_pg.INTERVAL(precision=3), Dialect.POSTGRES), "INTERVAL(3)")
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.INTERVAL(precision=3, fields="day to second"), Dialect.POSTGRES),
+            "INTERVAL DAY TO SECOND(3)",
+        )
+        self.assertEqual(
+            _format_sa_column_type(sa_pg.INTERVAL(fields="year to month"), Dialect.POSTGRES),
+            "INTERVAL YEAR TO MONTH",
+        )
+
+        # 1b. PostgreSQL live-reflected SA types (TIMESTAMP(p) WITH TIME ZONE,
+        #     TIME(p) WITH TIME ZONE, INTERVAL DAY TO SECOND(p)) must preserve
+        #     timezone/type family in CASE/COALESCE/NULLIF/GREATEST/ARRAY and
+        #     drop typmods cleanly in polymorphic aggregates (ARRAY_AGG/ANY_VALUE/MODE).
+        from matview.logical_ir import ColumnDef, TableSchema
+
+        pg_sa_schemas = {
+            "t_pg": TableSchema(
+                name="t_pg",
+                columns={
+                    "id": ColumnDef(name="id", data_type="INTEGER", not_null=True, primary_key=True),
+                    "g": ColumnDef(name="g", data_type="INTEGER"),
+                    "ts3": ColumnDef(name="ts3", data_type="TIMESTAMP(3)"),
+                    "tstz3": ColumnDef(name="tstz3", data_type="TIMESTAMP(3) WITH TIME ZONE"),
+                    "tstz4": ColumnDef(name="tstz4", data_type="TIMESTAMP(4) WITH TIME ZONE"),
+                    "tm3": ColumnDef(name="tm3", data_type="TIME(3)"),
+                    "tmtz3": ColumnDef(name="tmtz3", data_type="TIME(3) WITH TIME ZONE"),
+                    "iv3": ColumnDef(name="iv3", data_type="INTERVAL DAY TO SECOND(3)"),
+                },
+                pk_columns=("id",),
+            )
+        }
+        pg_proj = generate_materialized_view(
+            pg_sa_schemas,
+            "CREATE VIEW v_pg_sa AS SELECT id, "
+            "CASE WHEN g = 1 THEN tstz3 ELSE tstz3 END AS c_tstz, "
+            "CASE WHEN g = 1 THEN tmtz3 ELSE tmtz3 END AS c_tmtz, "
+            "COALESCE(ts3, tstz3) AS co_ts, "
+            "COALESCE(tm3, tmtz3) AS co_tm, "
+            "NULLIF(tstz3, tstz4) AS nf_tstz, "
+            "GREATEST(ts3, tstz3) AS gr_ts, "
+            "ARRAY[ts3, tstz3] AS arr_ts, "
+            "ARRAY[tstz3, tstz4] AS arr_tstz "
+            "FROM t_pg;",
+            dialect="postgres:18",
+        )
+        self.assertIn("c_tstz TIMESTAMP WITH TIME ZONE", pg_proj.backing_table_ddl)
+        self.assertIn("c_tmtz TIME WITH TIME ZONE", pg_proj.backing_table_ddl)
+        self.assertIn("co_ts TIMESTAMP WITH TIME ZONE", pg_proj.backing_table_ddl)
+        self.assertIn("co_tm TIME WITH TIME ZONE", pg_proj.backing_table_ddl)
+        self.assertIn("nf_tstz TIMESTAMP WITH TIME ZONE", pg_proj.backing_table_ddl)
+        self.assertIn("gr_ts TIMESTAMP WITH TIME ZONE", pg_proj.backing_table_ddl)
+        self.assertIn("arr_ts TIMESTAMP WITH TIME ZONE[]", pg_proj.backing_table_ddl)
+        self.assertIn("arr_tstz TIMESTAMP WITH TIME ZONE[]", pg_proj.backing_table_ddl)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", MatviewDiagnosticWarning)
+            pg_poly = generate_materialized_view(
+                pg_sa_schemas,
+                "CREATE VIEW v_pg_poly AS SELECT g, "
+                "ARRAY_AGG(tstz3 ORDER BY id) AS a_tstz, "
+                "MODE() WITHIN GROUP (ORDER BY tmtz3) AS m_tmtz, "
+                "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY iv3) AS p_iv "
+                "FROM t_pg GROUP BY g;",
+                dialect="postgres:18",
+            )
+        self.assertIn("a_tstz TIMESTAMP WITH TIME ZONE[]", pg_poly.backing_table_ddl)
+        self.assertIn("m_tmtz TIME WITH TIME ZONE", pg_poly.backing_table_ddl)
+        self.assertIn("p_iv INTERVAL", pg_poly.backing_table_ddl)
+        self.assertNotIn("TIMESTAMP(3) WITH TIME ZONE[]", pg_poly.backing_table_ddl)
+        self.assertNotIn("TIME(3) WITH TIME ZONE", pg_poly.backing_table_ddl)
+
+        # 2. Raw DB-API MySQL/MariaDB information_schema introspection retains
+        #    COLUMN_TYPE precision/widths for temporal, bit, binary, and ENUM/SET columns.
+        class _StubMySQLCursor:
+            def __init__(self) -> None:
+                self._rows: List[Tuple[Any, ...]] = []
+
+            def execute(self, sql: str, params: Any = None) -> None:
+                low = sql.lower()
+                if "referential_constraints" in low:
+                    self._rows = []
+                elif "information_schema.columns" in low:
+                    self._rows = [
+                        ("t", "id", "int", "NO", "PRI", "int(11)", None),
+                        ("t", "tm3", "time", "YES", "", "time(3)", None),
+                        ("t", "tm0", "time", "YES", "", "time", None),
+                        ("t", "dt6", "datetime", "YES", "", "datetime(6)", None),
+                        ("t", "ts4", "timestamp", "YES", "", "timestamp(4)", None),
+                        ("t", "b8", "bit", "YES", "", "bit(8)", None),
+                        ("t", "bin16", "binary", "YES", "", "binary(16)", None),
+                        ("t", "vbin32", "varbinary", "YES", "", "varbinary(32)", None),
+                        ("t", "en", "enum", "YES", "", "enum('a','B')", "utf8mb4_0900_ai_ci"),
+                        ("t", "st", "set", "YES", "", "set('x','Y')", "utf8mb4_0900_ai_ci"),
+                    ]
+                elif "information_schema.statistics" in low:
+                    self._rows = [("t", "PRIMARY", 0, "id")]
+                else:
+                    self._rows = []
+
+            def fetchall(self) -> List[Tuple[Any, ...]]:
+                return list(self._rows)
+
+            def close(self) -> None:
+                pass
+
+        class _StubMySQLConn:
+            def cursor(self) -> _StubMySQLCursor:
+                return _StubMySQLCursor()
+
+        with mock.patch("matview.connectivity._can_use_sqlalchemy_inspector", return_value=False):
+            introspected = introspect_database_schemas(_StubMySQLConn(), dialect=Dialect.MYSQL)
+        cols = introspected["t"].columns
+        self.assertEqual(cols["tm3"].data_type, "TIME(3)")
+        self.assertEqual(cols["tm0"].data_type, "TIME")
+        self.assertEqual(cols["dt6"].data_type, "DATETIME(6)")
+        self.assertEqual(cols["ts4"].data_type, "TIMESTAMP(4)")
+        self.assertEqual(cols["b8"].data_type, "BIT(8)")
+        self.assertEqual(cols["bin16"].data_type, "BINARY(16)")
+        self.assertEqual(cols["vbin32"].data_type, "VARBINARY(32)")
+        self.assertEqual(cols["en"].data_type, "ENUM('a','B')")
+        self.assertEqual(cols["st"].data_type, "SET('x','Y')")
+
+        # 3. Codegen preserves TIME(n)/DATETIME(n)/TIMESTAMP(n) across MIN/MAX,
+        #    COALESCE/CASE/CAST, typed temporal literals, UNION ALL, window,
+        #    arithmetic/mixed-type fallbacks, and explicit NULL/DEFAULT on TIMESTAMP.
+        schema = (
+            "CREATE TABLE t (id INT PRIMARY KEY, g INT, tm TIME(3), tm6 TIME(6), "
+            "dt DATETIME(3), dt6 DATETIME(6), ts TIMESTAMP(4) NULL, ts_nn TIMESTAMP(3) NOT NULL, "
+            "d DATE, s VARCHAR(20));"
+        )
+        for dialect in ("mysql:8.4", "mysql:9.7", "mariadb:11.8"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                p_mm = generate_materialized_view(
+                    schema,
+                    "CREATE VIEW v AS SELECT g, MAX(tm) AS m_tm, MIN(tm) AS n_tm, "
+                    "MAX(dt6) AS m_dt, MIN(ts) AS n_ts FROM t GROUP BY g;",
+                    dialect=dialect,
+                    ignore_limitations=True,
+                )
+                p_expr = generate_materialized_view(
+                    schema,
+                    "CREATE VIEW v AS SELECT id, COALESCE(tm, tm6) AS c_tm, "
+                    "COALESCE(dt, dt6) AS c_dt, COALESCE(dt, d) AS c_dtd, "
+                    "COALESCE(tm, TIME '00:00:00.123456') AS c_tlit, "
+                    "COALESCE(tm, s) AS c_tms, COALESCE(tm, dt6) AS c_tmdt, "
+                    "CASE WHEN g = 1 THEN tm ELSE tm6 END AS k_tm, "
+                    "CASE WHEN g = 1 THEN dt ELSE ts END AS k_dt, "
+                    "CASE WHEN g = 1 THEN tm ELSE NULL END AS kn_tm, "
+                    "CAST(tm AS TIME(5)) AS ct_tm, CAST(dt AS DATETIME(5)) AS ct_dt, "
+                    "tm + tm6 AS add_tm, ABS(tm) AS abs_tm, -tm AS neg_tm FROM t;",
+                    dialect=dialect,
+                    ignore_limitations=True,
+                )
+                p_mm_expr = generate_materialized_view(
+                    schema,
+                    "CREATE VIEW v AS SELECT g, MAX(COALESCE(tm, tm6)) AS m_tm, "
+                    "MIN(COALESCE(dt, dt6)) AS n_dt FROM t GROUP BY g;",
+                    dialect=dialect,
+                    ignore_limitations=True,
+                )
+                p_win = generate_materialized_view(
+                    schema,
+                    "CREATE VIEW v AS SELECT id, MAX(tm) OVER (PARTITION BY g) AS w_tm, "
+                    "MIN(dt6) OVER (PARTITION BY g) AS w_dt, MAX(ts) OVER (PARTITION BY g) AS w_ts FROM t;",
+                    dialect=dialect,
+                    ignore_limitations=True,
+                )
+                p_union = generate_materialized_view(
+                    schema,
+                    "CREATE VIEW v AS WITH u AS ("
+                    "SELECT g, tm AS tv, ts AS tsv, tm AS mix_td, tm AS mix_ts FROM t UNION ALL "
+                    "SELECT g, tm6 AS tv, ts_nn AS tsv, dt6 AS mix_td, s AS mix_ts FROM t"
+                    ") SELECT g, MAX(tv) AS m_tv, MIN(tsv) AS n_tsv, MAX(mix_td) AS m_td, MAX(mix_ts) AS m_ts FROM u GROUP BY g;",
+                    dialect=dialect,
+                    ignore_limitations=True,
+                )
+                p_grp_ts = generate_materialized_view(
+                    schema,
+                    "CREATE VIEW v AS SELECT ts_nn, COUNT(*) AS c FROM t GROUP BY ts_nn;",
+                    dialect=dialect,
+                    ignore_limitations=True,
+                )
+                p_pk_ts = generate_materialized_view(
+                    "CREATE TABLE tp (ts TIMESTAMP(3) PRIMARY KEY, v INT);",
+                    "CREATE VIEW v AS SELECT ts, v FROM tp;",
+                    dialect=dialect,
+                    ignore_limitations=True,
+                )
+            with self.subTest(dialect=dialect):
+                self.assertEqual(p_mm.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+                self.assertIn("m_tm TIME(3)", p_mm.backing_table_ddl)
+                self.assertIn("n_tm TIME(3)", p_mm.backing_table_ddl)
+                self.assertIn("m_dt DATETIME(6)", p_mm.backing_table_ddl)
+                self.assertIn("n_ts TIMESTAMP(4) NULL DEFAULT NULL", p_mm.backing_table_ddl)
+
+                self.assertIn("c_tm TIME(6)", p_expr.backing_table_ddl)
+                self.assertIn("c_dt DATETIME(6)", p_expr.backing_table_ddl)
+                self.assertIn("c_dtd DATETIME(3)", p_expr.backing_table_ddl)
+                self.assertIn("c_tlit TIME(6)", p_expr.backing_table_ddl)
+                self.assertIn("c_tms VARCHAR(255)", p_expr.backing_table_ddl)
+                self.assertIn("c_tmdt VARCHAR(255)", p_expr.backing_table_ddl)
+                self.assertIn("k_tm TIME(6)", p_expr.backing_table_ddl)
+                self.assertIn("k_dt DATETIME(4)", p_expr.backing_table_ddl)
+                self.assertIn("kn_tm TIME(3)", p_expr.backing_table_ddl)
+                self.assertIn("ct_tm TIME(5)", p_expr.backing_table_ddl)
+                self.assertIn("ct_dt DATETIME(5)", p_expr.backing_table_ddl)
+                # Arithmetic / ABS / unary negation on TIME must never stay TIME.
+                self.assertNotIn("add_tm TIME", p_expr.backing_table_ddl)
+                self.assertNotIn("abs_tm TIME", p_expr.backing_table_ddl)
+                self.assertNotIn("neg_tm TIME", p_expr.backing_table_ddl)
+
+                self.assertIn("m_tm TIME(6)", p_mm_expr.backing_table_ddl)
+                self.assertIn("n_dt DATETIME(6)", p_mm_expr.backing_table_ddl)
+
+                self.assertIn("w_tm TIME(3)", p_win.backing_table_ddl)
+                self.assertIn("w_dt DATETIME(6)", p_win.backing_table_ddl)
+                self.assertIn("w_ts TIMESTAMP(4) NULL DEFAULT NULL", p_win.backing_table_ddl)
+
+                self.assertIn("m_tv TIME(6)", p_union.backing_table_ddl)
+                self.assertIn("n_tsv TIMESTAMP(4) NULL DEFAULT NULL", p_union.backing_table_ddl)
+                self.assertIn("m_td VARCHAR(255)", p_union.backing_table_ddl)
+                self.assertIn("m_ts VARCHAR(255)", p_union.backing_table_ddl)
+
+                self.assertIn("ts_nn TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)", p_grp_ts.backing_table_ddl)
+                self.assertIn("ts TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)", p_pk_ts.backing_table_ddl)
+                self.assertNotIn("NULL DEFAULT NULL", p_pk_ts.backing_table_ddl)
+
 
 class NativeResultTypeTests(unittest.TestCase):
     # Views registered on one base table at a time: per-statement trigger
@@ -2715,6 +2961,174 @@ class SetopCommonTypesPgCatalogAndNameTests(unittest.TestCase):
                 cur.execute(f"DROP VIEW IF EXISTS lv_{label}_{tag}")
             for tbl in (ta, tb):
                 cur.execute(f"DROP TABLE IF EXISTS {tbl}")
+            conn.commit()
+            conn.close()
+
+    def test_native_mysql_temporal_precision_minmax_and_expressions(self) -> None:
+        import os
+        from unittest import mock
+
+        from matview.connectivity import introspect_database_schemas
+
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN not set")
+        tag = f"tmpfsp_{uuid.uuid4().hex[:8]}"
+        t = f"t_{tag}"
+        conn = _connect(Dialect.MYSQL, dsn)
+        cur = conn.cursor()
+        specs = [
+            (
+                "repro_time_minmax",
+                f"SELECT g, MAX(tm) AS m, MIN(tm) AS n FROM {t} GROUP BY g",
+            ),
+            (
+                "all_temporal_minmax",
+                f"SELECT g, MAX(tm) AS m_tm, MIN(tm) AS n_tm, MAX(tm6) AS m_tm6, MIN(tm6) AS n_tm6, "
+                f"MAX(dt) AS m_dt, MIN(dt) AS n_dt, MAX(dt6) AS m_dt6, MIN(dt6) AS n_dt6, "
+                f"MAX(ts) AS m_ts, MIN(ts) AS n_ts FROM {t} GROUP BY g",
+            ),
+            (
+                "temporal_expr_minmax",
+                f"SELECT g, MAX(COALESCE(tm, tm6)) AS m_ctm, MIN(COALESCE(dt, dt6)) AS n_cdt FROM {t} GROUP BY g",
+            ),
+            (
+                "temporal_proj_exprs",
+                f"SELECT id, COALESCE(tm, tm6) AS c_tm, COALESCE(ts, ts_nn) AS c_ts, "
+                f"CASE WHEN g = 1 THEN dt ELSE ts END AS k_dt, "
+                f"CASE WHEN g = 1 THEN ts ELSE ts_nn END AS k_ts, "
+                f"CAST(tm AS TIME(5)) AS ct_tm, CAST(dt AS DATETIME(5)) AS ct_dt FROM {t}",
+            ),
+            (
+                "temporal_win_minmax",
+                f"SELECT id, MAX(tm) OVER (PARTITION BY g) AS w_tm, MIN(dt6) OVER (PARTITION BY g) AS w_dt FROM {t}",
+            ),
+            (
+                "temporal_union_minmax",
+                f"WITH u AS (SELECT g, tm AS tv, ts AS tsv FROM {t} UNION ALL "
+                f"SELECT g, tm6 AS tv, ts_nn AS tsv FROM {t}) "
+                f"SELECT g, MAX(tv) AS m_tv, MIN(tv) AS n_tv, MAX(tsv) AS m_tsv, MIN(tsv) AS n_tsv "
+                f"FROM u GROUP BY g",
+            ),
+            (
+                "group_by_ts_nn",
+                f"SELECT ts_nn, COUNT(*) AS c FROM {t} GROUP BY ts_nn",
+            ),
+            (
+                "group_by_tm_dt6",
+                f"SELECT tm, dt6, COUNT(*) AS c FROM {t} GROUP BY tm, dt6",
+            ),
+        ]
+        try:
+            cur.execute(
+                f"CREATE TABLE {t} ("
+                "id INT PRIMARY KEY, g INT, tm TIME(3), tm6 TIME(6), "
+                "dt DATETIME(3), dt6 DATETIME(6), ts TIMESTAMP(4) NULL, "
+                "ts_nn TIMESTAMP(3) NOT NULL DEFAULT '2026-01-01 00:00:00.000'"
+                ") ENGINE=InnoDB"
+            )
+            cur.execute(
+                f"INSERT INTO {t} VALUES "
+                "(1, 1, '10:00:00.123', '10:00:00.123456', '2026-03-01 10:00:00.123', '2026-03-01 10:00:00.123456', '2026-03-01 10:00:00.1234', '2026-03-01 08:00:00.250'), "
+                "(2, 1, '09:00:00.500', '09:00:00.500001', '2026-03-01 09:00:00.500', '2026-03-01 09:00:00.500001', '2026-03-01 09:00:00.5001', '2026-03-01 08:00:00.250'), "
+                "(3, 2, '-01:02:03.456', '-01:02:03.456789', '2026-02-28 23:59:59.999', '2026-02-28 23:59:59.999999', NULL, '2026-03-01 09:00:00.750'), "
+                "(4, 3, NULL, NULL, NULL, NULL, NULL, '2026-03-01 09:00:00.750'), "
+                # tm/dt NULL while tm6/dt6 carry 6-digit fractional values so COALESCE(tm, tm6)
+                # and COALESCE(dt, dt6) actually exercise sub-millisecond fallback precision.
+                "(7, 1, NULL, '10:30:00.654321', NULL, '2026-03-01 08:30:00.111222', NULL, '2026-03-01 08:00:00.250')"
+            )
+            conn.commit()
+
+            # Verify live raw DB-API introspection (bypassing SQLAlchemy) preserves all FSP modifiers.
+            with mock.patch("matview.connectivity._can_use_sqlalchemy_inspector", return_value=False):
+                raw_schemas = introspect_database_schemas(conn, dialect=Dialect.MYSQL)
+            conn.commit()
+            raw_cols = raw_schemas[t].columns
+            self.assertEqual(raw_cols["tm"].data_type, "TIME(3)")
+            self.assertEqual(raw_cols["tm6"].data_type, "TIME(6)")
+            self.assertEqual(raw_cols["dt"].data_type, "DATETIME(3)")
+            self.assertEqual(raw_cols["dt6"].data_type, "DATETIME(6)")
+            self.assertEqual(raw_cols["ts"].data_type, "TIMESTAMP(4)")
+            self.assertEqual(raw_cols["ts_nn"].data_type, "TIMESTAMP(3)")
+
+            mgr = MaterializedViewManager(conn, dialect=Dialect.MYSQL)
+            pairs = []
+            for label, sel in specs:
+                mv, lv = f"mv_{label}_{tag}", f"lv_{label}_{tag}"
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", EngineLimitationWarning)
+                    plan = mgr.register_view(f"CREATE VIEW {mv} AS {sel};", ignore_limitations=True)
+                if label in ("repro_time_minmax", "all_temporal_minmax"):
+                    self.assertEqual(plan.strategy, MaintenanceStrategy.ALGEBRAIC_DELTA)
+                conn.commit()
+                cur.execute(f"CREATE VIEW {lv} AS {sel}")
+                conn.commit()
+                pairs.append((label, mv, lv))
+
+            def check(step: str) -> None:
+                for label, mv, lv in pairs:
+                    cur.execute(f"SELECT * FROM {mv}")
+                    got = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=repr)
+                    da = _description(cur)
+                    cur.execute(f"SELECT * FROM {lv}")
+                    exp = sorted((tuple(_exact(v) for v in r) for r in cur.fetchall()), key=repr)
+                    db = _description(cur)
+                    cat_mv = _catalog_types(Dialect.MYSQL, cur, mv)
+                    cat_lv = _catalog_types(Dialect.MYSQL, cur, lv)
+                    conn.commit()
+                    self.assertEqual(got, exp, f"MySQL {label} {step}: {got} != {exp}")
+                    self.assertEqual(_metadata_mismatches(Dialect.MYSQL, da, db), [], f"MySQL {label} {step} metadata")
+                    self.assertEqual(cat_mv, cat_lv, f"MySQL {label} {step} catalog: {cat_mv} != {cat_lv}")
+
+            check("initial")
+            # Insert a new non-extreme row (also bumps COUNT(*) for ts_nn group,
+            # verifying MariaDB does not mutate ts_nn via implicit ON UPDATE CURRENT_TIMESTAMP).
+            cur.execute(
+                f"INSERT INTO {t} VALUES "
+                "(5, 1, '09:30:00.001', '09:30:00.000001', '2026-03-01 09:30:00.001', '2026-03-01 09:30:00.000001', '2026-03-01 09:30:00.9999', '2026-03-01 08:00:00.250')"
+            )
+            conn.commit()
+            check("after_insert_non_extreme")
+
+            # Insert a new high extreme and update an extreme down (triggers extreme recompute).
+            cur.execute(
+                f"INSERT INTO {t} VALUES "
+                "(6, 1, '12:34:56.789', '12:34:56.789012', '2026-03-01 12:34:56.789', '2026-03-01 12:34:56.789012', '2026-03-01 12:34:56.7891', '2026-03-01 12:00:00.005')"
+            )
+            cur.execute(
+                f"UPDATE {t} SET tm = '08:00:00.999', dt6 = '2026-03-01 08:00:00.999999', ts = '2026-03-01 08:00:00.9999' WHERE id = 6"
+            )
+            conn.commit()
+            check("after_insert_and_extreme_update")
+
+            # Rolled-back write must leave every view unchanged.
+            cur.execute(
+                f"INSERT INTO {t} VALUES "
+                "(99, 1, '23:59:59.999', '23:59:59.999999', '2026-12-31 23:59:59.999', '2026-12-31 23:59:59.999999', '2026-12-31 23:59:59.9999', '2026-12-31 23:59:59.999')"
+            )
+            conn.rollback()
+            check("after_rollback")
+
+            # Delete extremes and set all values in a group to NULL.
+            cur.execute(f"DELETE FROM {t} WHERE id IN (1, 6)")
+            cur.execute(f"UPDATE {t} SET tm = NULL, tm6 = NULL, dt = NULL, dt6 = NULL, ts = NULL WHERE id = 3")
+            conn.commit()
+            check("after_extreme_delete_and_null_group")
+
+            # Verify check_schema_drift reports every registered view as "ok".
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                drift = mgr.check_schema_drift()
+            self.assertEqual(drift, {mv: "ok" for _, mv, _ in pairs}, f"Unexpected schema drift: {drift}")
+        finally:
+            conn.rollback()
+            for label, _ in specs:
+                try:
+                    MaterializedViewManager(conn, dialect=Dialect.MYSQL).drop_view(f"mv_{label}_{tag}")
+                except Exception:
+                    conn.rollback()
+                cur.execute(f"DROP VIEW IF EXISTS lv_{label}_{tag}")
+            cur.execute(f"DROP TABLE IF EXISTS {t}")
             conn.commit()
             conn.close()
 

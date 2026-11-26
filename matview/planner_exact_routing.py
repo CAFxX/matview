@@ -937,7 +937,7 @@ class ExactAggregateRoutingMixin(MixinHost):
             if name in ("PERCENT_RANK", "CUME_DIST"):
                 return "DOUBLE PRECISION"
             if name == "PERCENTILE_CONT":
-                base = "INTERVAL" if key_t and key_t.upper() == "INTERVAL" else "DOUBLE PRECISION"
+                base = "INTERVAL" if key_t and key_t.upper().startswith("INTERVAL") else "DOUBLE PRECISION"
                 return base + "[]" if is_array else base
             if name in ("PERCENTILE_DISC", "MODE") and key_t:
                 return key_t + "[]" if is_array and name == "PERCENTILE_DISC" else key_t
@@ -993,13 +993,23 @@ def _pg_drop_typmod(type_sql: str) -> str:
     the backing column drops it too. Values keep their own scale/length.
     ``char(n)`` becomes ``bpchar`` (a bare ``char`` means ``char(1)``); a
     ``bit(n)`` keeps its modifier (a bare ``bit`` means ``bit(1)``)."""
-    m = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_ ]*?)\s*\([^)]*\)\s*((?:\[\])*)\s*", type_sql)
+    s = re.sub(r"\s+", " ", type_sql.strip())
+    m_arr = re.match(r"^(.*?)((?:\[\])+)$", s)
+    elem, dims = (m_arr.group(1).strip(), m_arr.group(2)) if m_arr else (s, "")
+    if elem.upper().startswith("INTERVAL"):
+        return "INTERVAL" + dims
+    m = re.fullmatch(
+        r"([A-Za-z_][A-Za-z0-9_ ]*?)\s*\([^)]*\)(\s+WITH(?:OUT)?\s+TIME\s+ZONE)?",
+        elem,
+        flags=re.IGNORECASE,
+    )
     if not m:
         return type_sql
-    base, dims = m.group(1).strip(), m.group(2)
+    base = m.group(1).strip()
+    tz_tail = re.sub(r"\s+", " ", (m.group(2) or "")).upper()
     up = base.upper()
     if up in ("BIT", "BIT VARYING", "VARBIT"):
         return type_sql
     if up in ("CHAR", "CHARACTER", "BPCHAR"):
         base = "BPCHAR"
-    return base + dims
+    return f"{base}{tz_tail}{dims}"
