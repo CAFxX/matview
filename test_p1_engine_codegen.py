@@ -2715,5 +2715,378 @@ class TestNonstandardSqliteStatisticsRefusal(unittest.TestCase):
             self.assertNotIn(other, message.replace("stats_" + other, ""))
 
 
+class TestMariaDBUpdateIgnoreGuard(unittest.TestCase):
+    """Offline codegen and native MariaDB edge-case tests for the ignored-update guard."""
+
+    _MARIADB = parse_engine_version(Dialect.MYSQL, "11.8.9-MariaDB")
+    _MYSQL = parse_engine_version(Dialect.MYSQL, "8.4.13")
+
+    def test_mariadb_update_ignore_guard_codegen_shapes(self) -> None:
+        # 1. PK / UNIQUE NOT NULL: O(1) keyed SUM(IF(...)) = 0 in AFTER UPDATE, NO BEFORE UPDATE trigger.
+        for ddl in (
+            "CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT);",
+            "CREATE TABLE t (id INT NOT NULL UNIQUE, g INT, v INT);",
+        ):
+            plan = generate_materialized_view(
+                parse_table_schema(ddl, dialect=Dialect.MYSQL),
+                "CREATE VIEW v_t AS SELECT g, SUM(v) AS s, COUNT(*) AS c FROM t GROUP BY g",
+                dialect=Dialect.MYSQL,
+                engine_version=self._MARIADB,
+                ignore_limitations=True,
+            )
+            self.assertFalse(any(t.endswith("_bu") for t in plan.trigger_names), plan.trigger_names)
+            au_ddl = next(s for s in plan.trigger_ddls if "AFTER UPDATE" in s)
+            self.assertIn("SELECT COALESCE(SUM(IF(", au_ddl)
+            self.assertIn("FROM t AS __mv_cur WHERE __mv_cur.id = OLD.id LOCK IN SHARE MODE) = 0", au_ddl)
+            self.assertNotIn("@__mv_oc_", au_ddl)
+
+        # 2. Single nullable UNIQUE key: BEFORE UPDATE captures @__mv_oc_<hash> on OLD.u IS NULL
+        #    using WHERE __mv_cur.u IS NULL (never __mv_cur.u <=> OLD.u), and AFTER UPDATE uses
+        #    CASE WHEN OLD.u IS NOT NULL THEN (...) = 0 ELSE ... < @__mv_oc_<hash>.
+        plan_nu = generate_materialized_view(
+            parse_table_schema("CREATE TABLE nu (u INT UNIQUE, g INT, v INT);", dialect=Dialect.MYSQL),
+            "CREATE VIEW v_nu AS SELECT g, SUM(v) AS s, COUNT(*) AS c FROM nu GROUP BY g",
+            dialect=Dialect.MYSQL,
+            engine_version=self._MARIADB,
+            ignore_limitations=True,
+        )
+        self.assertTrue(any(t.endswith("_bu") for t in plan_nu.trigger_names), plan_nu.trigger_names)
+        bu_nu = next(s for s in plan_nu.trigger_ddls if "BEFORE UPDATE" in s)
+        au_nu = next(s for s in plan_nu.trigger_ddls if "AFTER UPDATE" in s)
+        self.assertIn("OLD.u IS NULL", bu_nu)
+        self.assertIn("INTO @__mv_oc_", bu_nu)
+        self.assertIn("WHERE __mv_cur.u IS NULL LOCK IN SHARE MODE", bu_nu)
+        self.assertIn("WHEN OLD.u IS NOT NULL THEN (SELECT COALESCE(SUM(IF(", au_nu)
+        self.assertIn("NEW.u IS NULL", au_nu)
+        self.assertIn("< @__mv_oc_", au_nu)
+
+        # 3. Two nullable UNIQUE keys: BOTH keys get WHEN branches and BEFORE UPDATE checks BOTH NULL.
+        plan_nu2 = generate_materialized_view(
+            parse_table_schema("CREATE TABLE nu2 (u1 INT UNIQUE, u2 INT UNIQUE, g INT, v INT);", dialect=Dialect.MYSQL),
+            "CREATE VIEW v_nu2 AS SELECT g, SUM(v) AS s FROM nu2 GROUP BY g",
+            dialect=Dialect.MYSQL,
+            engine_version=self._MARIADB,
+            ignore_limitations=True,
+        )
+        bu_nu2 = next(s for s in plan_nu2.trigger_ddls if "BEFORE UPDATE" in s)
+        au_nu2 = next(s for s in plan_nu2.trigger_ddls if "AFTER UPDATE" in s)
+        self.assertIn("(OLD.u1 IS NULL) AND (OLD.u2 IS NULL)", bu_nu2)
+        self.assertIn("WHEN OLD.u1 IS NOT NULL THEN (SELECT COALESCE(SUM(IF(", au_nu2)
+        self.assertIn("WHEN OLD.u2 IS NOT NULL THEN (SELECT COALESCE(SUM(IF(", au_nu2)
+
+        # 4. Composite nullable UNIQUE(a, b): WHEN checks both non-NULL, BEFORE checks either NULL.
+        plan_nuc = generate_materialized_view(
+            parse_table_schema("CREATE TABLE nuc (a INT, b INT, g INT, v INT, UNIQUE (a, b));", dialect=Dialect.MYSQL),
+            "CREATE VIEW v_nuc AS SELECT g, SUM(v) AS s FROM nuc GROUP BY g",
+            dialect=Dialect.MYSQL,
+            engine_version=self._MARIADB,
+            ignore_limitations=True,
+        )
+        bu_nuc = next(s for s in plan_nuc.trigger_ddls if "BEFORE UPDATE" in s)
+        au_nuc = next(s for s in plan_nuc.trigger_ddls if "AFTER UPDATE" in s)
+        self.assertIn("OLD.a IS NULL OR OLD.b IS NULL", bu_nuc)
+        self.assertIn("WHEN OLD.a IS NOT NULL AND OLD.b IS NOT NULL THEN (SELECT COALESCE(SUM(IF(", au_nuc)
+
+        # 5. Keyless table with FK: BEFORE UPDATE + AFTER UPDATE count-drop guard emitted.
+        plan_fk = generate_materialized_view(
+            parse_table_schema(
+                "CREATE TABLE p (id INT PRIMARY KEY);"
+                "CREATE TABLE c (pid INT, g INT, v INT, FOREIGN KEY (pid) REFERENCES p(id));",
+                dialect=Dialect.MYSQL,
+            ),
+            "CREATE VIEW v_c AS SELECT g, SUM(v) AS s FROM c GROUP BY g",
+            dialect=Dialect.MYSQL,
+            engine_version=self._MARIADB,
+            ignore_limitations=True,
+        )
+        self.assertTrue(any(t.endswith("_bu") for t in plan_fk.trigger_names), plan_fk.trigger_names)
+        bu_fk = next(s for s in plan_fk.trigger_ddls if "BEFORE UPDATE" in s)
+        au_fk = next(s for s in plan_fk.trigger_ddls if "AFTER UPDATE" in s)
+        self.assertIn("INTO @__mv_oc_", bu_fk)
+        self.assertIn("< @__mv_oc_", au_fk)
+
+        # 6. Keyless table WITHOUT any unique key or FK: no guard, no BEFORE UPDATE.
+        plan_nk = generate_materialized_view(
+            parse_table_schema("CREATE TABLE nk (g INT, v INT);", dialect=Dialect.MYSQL),
+            "CREATE VIEW v_nk AS SELECT g, SUM(v) AS s FROM nk GROUP BY g",
+            dialect=Dialect.MYSQL,
+            engine_version=self._MARIADB,
+            ignore_limitations=True,
+        )
+        self.assertFalse(any(t.endswith("_bu") for t in plan_nk.trigger_names))
+        au_nk = next(s for s in plan_nk.trigger_ddls if "AFTER UPDATE" in s)
+        self.assertNotIn("__mv_cur", au_nk)
+        self.assertNotIn("@__mv_oc_", au_nk)
+
+        # 7. mysql_prelock (MIN/MAX) + nullable UNIQUE key: single combined _bu trigger,
+        #    mv_table prelock BEFORE base_t count, and count outside changed_guard.
+        plan_mm = generate_materialized_view(
+            parse_table_schema("CREATE TABLE nu (u INT UNIQUE, g INT, v INT);", dialect=Dialect.MYSQL),
+            "CREATE VIEW v_mm AS SELECT g, MIN(v) AS mn FROM nu GROUP BY g",
+            dialect=Dialect.MYSQL,
+            engine_version=self._MARIADB,
+            ignore_limitations=True,
+        )
+        bu_triggers = [s for s in plan_mm.trigger_ddls if "BEFORE UPDATE" in s]
+        self.assertEqual(len(bu_triggers), 1)
+        bu_mm = bu_triggers[0]
+        self.assertLess(bu_mm.index("UPDATE "), bu_mm.index("INTO @__mv_oc_"))
+
+        # 8. TIMESTAMP(3) columns omit CAST(... AS BINARY) to avoid MariaDB's
+        #    cond_equal constant-propagation bug stripping fractional seconds.
+        plan_ts = generate_materialized_view(
+            parse_table_schema(
+                "CREATE TABLE ts_t (u INT UNIQUE, ts TIMESTAMP(3) NULL, g INT, v INT);",
+                dialect=Dialect.MYSQL,
+            ),
+            "CREATE VIEW v_ts AS SELECT ts, SUM(v) AS s FROM ts_t GROUP BY ts",
+            dialect=Dialect.MYSQL,
+            engine_version=self._MARIADB,
+            ignore_limitations=True,
+        )
+        bu_ts = next(s for s in plan_ts.trigger_ddls if "BEFORE UPDATE" in s)
+        au_ts = next(s for s in plan_ts.trigger_ddls if "AFTER UPDATE" in s)
+        self.assertIn("(__mv_cur.ts <=> OLD.ts)", bu_ts)
+        self.assertNotIn("CAST(__mv_cur.ts AS BINARY)", bu_ts)
+        self.assertNotIn("CAST(__mv_cur.ts AS BINARY)", au_ts)
+
+        # 9. Keyless partitioned table: BEFORE/AFTER count-drop guard emitted.
+        plan_part = generate_materialized_view(
+            parse_table_schema(
+                "CREATE TABLE p1 (g INT, v INT) ENGINE=InnoDB "
+                "PARTITION BY RANGE (g) (PARTITION p0 VALUES LESS THAN (10));",
+                dialect=Dialect.MYSQL,
+            ),
+            "CREATE VIEW v_p1 AS SELECT g, SUM(v) AS s FROM p1 GROUP BY g",
+            dialect=Dialect.MYSQL,
+            engine_version=self._MARIADB,
+            ignore_limitations=True,
+        )
+        self.assertTrue(any(t.endswith("_bu") for t in plan_part.trigger_names))
+        bu_part = next(s for s in plan_part.trigger_ddls if "BEFORE UPDATE" in s)
+        au_part = next(s for s in plan_part.trigger_ddls if "AFTER UPDATE" in s)
+        self.assertIn("INTO @__mv_oc_", bu_part)
+        self.assertIn("< @__mv_oc_", au_part)
+
+        # 10. Nullable UNIQUE + FK or partitioned: MUST NOT take the `NEW.u IS NULL` short-circuit.
+        for ddl in (
+            "CREATE TABLE p (id INT PRIMARY KEY);"
+            "CREATE TABLE nu_fk (u INT UNIQUE, pid INT, g INT, v INT, FOREIGN KEY (pid) REFERENCES p(id));",
+            "CREATE TABLE nu_p (u INT, g INT, v INT, UNIQUE (u, g)) ENGINE=InnoDB "
+            "PARTITION BY RANGE (g) (PARTITION p0 VALUES LESS THAN (10));",
+        ):
+            tbl = "nu_fk" if "nu_fk" in ddl else "nu_p"
+            plan_nk = generate_materialized_view(
+                parse_table_schema(ddl, dialect=Dialect.MYSQL),
+                f"CREATE VIEW v_{tbl} AS SELECT g, SUM(v) AS s FROM {tbl} GROUP BY g",
+                dialect=Dialect.MYSQL,
+                engine_version=self._MARIADB,
+                ignore_limitations=True,
+            )
+            au_nk = next(s for s in plan_nk.trigger_ddls if "AFTER UPDATE" in s)
+            self.assertNotIn("NEW.u IS NULL", au_nk)
+            self.assertIn("< @__mv_oc_", au_nk)
+
+        # 11. Offline `CREATE UNIQUE INDEX ... ON t (u(5))` prefix index is recognized and guarded.
+        for idx_sql in (
+            "CREATE UNIQUE INDEX uq_u ON pfx (u(5));",
+            "CREATE UNIQUE INDEX uq_u ON pfx (`u`(5) DESC);",
+        ):
+            plan_pfx = generate_materialized_view(
+                parse_table_schema(
+                    f"CREATE TABLE pfx (u VARCHAR(20), g INT, v INT); {idx_sql}",
+                    dialect=Dialect.MYSQL,
+                ),
+                "CREATE VIEW v_pfx AS SELECT g, SUM(v) AS s FROM pfx GROUP BY g",
+                dialect=Dialect.MYSQL,
+                engine_version=self._MARIADB,
+                ignore_limitations=True,
+            )
+            self.assertTrue(any(t.endswith("_bu") for t in plan_pfx.trigger_names))
+            au_pfx = next(s for s in plan_pfx.trigger_ddls if "AFTER UPDATE" in s)
+            self.assertIn("WHEN OLD.u IS NOT NULL THEN", au_pfx)
+            self.assertIn("< @__mv_oc_", au_pfx)
+
+        # 12. MySQL (non-MariaDB) emits neither guard nor _bu count trigger.
+        plan_my = generate_materialized_view(
+            parse_table_schema("CREATE TABLE nu (u INT UNIQUE, g INT, v INT);", dialect=Dialect.MYSQL),
+            "CREATE VIEW v_nu AS SELECT g, SUM(v) AS s FROM nu GROUP BY g",
+            dialect=Dialect.MYSQL,
+            engine_version=self._MYSQL,
+            ignore_limitations=True,
+        )
+        self.assertFalse(any(t.endswith("_bu") for t in plan_my.trigger_names))
+        au_my = next(s for s in plan_my.trigger_ddls if "AFTER UPDATE" in s)
+        self.assertNotIn("__mv_cur", au_my)
+        self.assertNotIn("@__mv_oc_", au_my)
+
+    def test_native_mariadb_update_ignore_nullable_unique_and_keyless_fk_edge_cases(self) -> None:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN not set")
+        import uuid
+        import pymysql
+        from typing import Any
+
+        parsed = urlparse(dsn)
+        def _connect() -> Any:
+            return pymysql.connect(
+                host=parsed.hostname or "127.0.0.1",
+                port=parsed.port or 3306,
+                user=parsed.username or "root",
+                password=parsed.password or "",
+                database=parsed.path.lstrip("/"),
+                autocommit=False,
+            )
+
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute("SELECT VERSION()")
+        ver_str = str((cur.fetchone() or ("",))[0])
+        if "mariadb" not in ver_str.lower():
+            cur.close()
+            conn.close()
+            self.skipTest("MariaDB-specific test")
+
+        tag = f"mdui_{uuid.uuid4().hex[:8]}"
+        t_ty = f"{tag}_ty"
+        t_bu = f"{tag}_bu"
+        t_par = f"{tag}_par"
+        t_chd = f"{tag}_chd"
+        t_dr = f"{tag}_dr"
+        t_j = f"{tag}_j"
+        views = [
+            f"{tag}_v_ty", f"{tag}_v_ty_dist", f"{tag}_v_bu",
+            f"{tag}_v_par", f"{tag}_v_dr", f"{tag}_v_join", f"{tag}_v_un",
+        ]
+        mgr = MaterializedViewManager(conn, dialect=Dialect.MYSQL, ignore_limitations=True)
+        try:
+            # 1. Case-insensitive VARCHAR UNIQUE + TIMESTAMP(3) + FLOAT + DISTINCT + JOIN + UNION
+            cur.execute(
+                f"CREATE TABLE {t_ty} ("
+                f"u VARCHAR(16) COLLATE utf8mb4_general_ci UNIQUE, "
+                f"ts TIMESTAMP(3) NULL, f FLOAT, g INT, v INT) ENGINE=InnoDB"
+            )
+            cur.execute(f"CREATE TABLE {t_j} (g INT PRIMARY KEY, lbl VARCHAR(16)) ENGINE=InnoDB")
+            cur.execute(f"INSERT INTO {t_j} VALUES (1, 'one'), (2, 'two')")
+            cur.execute(
+                f"INSERT INTO {t_ty} VALUES "
+                f"(NULL, '2024-03-05 12:00:00.123', 0.8, 1, 5), "
+                f"(NULL, '2024-03-05 12:00:00.123', 0.8, 1, 5), "
+                f"('a',  '2024-03-05 12:00:00.456', 1.5, 2, 7)"
+            )
+            # 2. User BEFORE UPDATE trigger mutating NEW.v on nullable UNIQUE table
+            cur.execute(f"CREATE TABLE {t_bu} (u INT UNIQUE, g INT, v INT, pad INT) ENGINE=InnoDB")
+            cur.execute(f"INSERT INTO {t_bu} VALUES (NULL, 1, 5, 0), (NULL, 1, 5, 0), (2, 2, 7, 0)")
+            # 3. Incoming FK on keyless parent table (non-unique index)
+            cur.execute(f"CREATE TABLE {t_par} (k INT, g INT, v INT, INDEX (k)) ENGINE=InnoDB")
+            cur.execute(
+                f"CREATE TABLE {t_chd} (pid INT, FOREIGN KEY (pid) REFERENCES {t_par}(k)) ENGINE=InnoDB"
+            )
+            cur.execute(f"INSERT INTO {t_par} VALUES (1, 1, 5), (1, 1, 5)")
+            cur.execute(f"INSERT INTO {t_chd} VALUES (1)")
+            # 4. Drift detection when a nullable UNIQUE index is added out-of-band to a keyless table
+            cur.execute(f"CREATE TABLE {t_dr} (u INT, g INT, v INT) ENGINE=InnoDB")
+            cur.execute(f"INSERT INTO {t_dr} VALUES (NULL, 1, 5), (NULL, 1, 5), (2, 2, 7)")
+            # 5. Primary-key table with TIMESTAMP(3) + UNIQUE collision (regression for MariaDB
+            #    WHERE-clause cond_equal bug on TIMESTAMP(n))
+            t_pkts = f"{tag}_pkts"
+            cur.execute(
+                f"CREATE TABLE {t_pkts} (id INT PRIMARY KEY, u INT UNIQUE, ts TIMESTAMP(3) NULL, g INT, v INT) ENGINE=InnoDB"
+            )
+            cur.execute(
+                f"INSERT INTO {t_pkts} VALUES "
+                f"(1, 10, '2024-03-05 12:00:00.123', 1, 5), "
+                f"(2, 20, '2024-03-05 12:00:00.456', 2, 7)"
+            )
+            conn.commit()
+
+            view_sqls = {
+                f"{tag}_v_ty": f"SELECT g, SUM(v) AS s, COUNT(*) AS c FROM {t_ty} GROUP BY g",
+                f"{tag}_v_ty_dist": f"SELECT DISTINCT g, v FROM {t_ty}",
+                f"{tag}_v_bu": f"SELECT g, SUM(v) AS s, COUNT(*) AS c FROM {t_bu} GROUP BY g",
+                f"{tag}_v_par": f"SELECT g, SUM(v) AS s, COUNT(*) AS c FROM {t_par} GROUP BY g",
+                f"{tag}_v_dr": f"SELECT g, SUM(v) AS s, COUNT(*) AS c FROM {t_dr} GROUP BY g",
+                f"{tag}_v_pkts": f"SELECT ts, SUM(v) AS s, COUNT(*) AS c FROM {t_pkts} GROUP BY ts",
+                f"{tag}_v_join": (
+                    f"SELECT j.lbl, SUM(t.v) AS s, COUNT(*) AS c "
+                    f"FROM {t_ty} t JOIN {t_j} j ON t.g = j.g GROUP BY j.lbl"
+                ),
+                f"{tag}_v_un": f"SELECT g, v FROM {t_ty} UNION SELECT g, v FROM {t_bu}",
+            }
+            views.append(f"{tag}_v_pkts")
+            for vn, sql in view_sqls.items():
+                mgr.register_view(f"CREATE VIEW {vn} AS {sql};")
+            conn.commit()
+
+            # Install a user BEFORE UPDATE trigger AFTER registration that mutates NEW.v
+            cur.execute(
+                f"CREATE TRIGGER {tag}_usr_bu BEFORE UPDATE ON {t_bu} FOR EACH ROW "
+                f"SET NEW.v = OLD.v + 10;"
+            )
+            conn.commit()
+
+            def _assert_all_exact(label: str) -> None:
+                for vn, sql in view_sqls.items():
+                    cur.execute(f"SELECT * FROM {vn}")
+                    got = sorted(cur.fetchall(), key=lambda r: tuple("" if x is None else str(x) for x in r))
+                    cur.execute(sql)
+                    exp = sorted(cur.fetchall(), key=lambda r: tuple("" if x is None else str(x) for x in r))
+                    self.assertEqual(got, exp, f"{label}: view {vn} diverged")
+
+            # Case-insensitive collision ('A' collides with 'a') + case-only update ('a' -> 'A')
+            # + FLOAT subtle change + TIMESTAMP(3) fractional seconds
+            for stmt in (
+                f"UPDATE IGNORE {t_ty} SET u = 'A', v = 9 WHERE u IS NULL",
+                f"UPDATE {t_ty} SET u = 'A', f = 0.8 * 1.0000001 WHERE u = 'a'",
+                f"UPDATE IGNORE {t_ty} SET u = 'b', v = 11 WHERE u IS NULL",
+                # User BEFORE UPDATE mutates NEW.v even when only pad changes; both skipped & applied!
+                f"UPDATE IGNORE {t_bu} SET u = 2, pad = 1 WHERE u IS NULL",
+                f"UPDATE {t_bu} SET pad = 2 WHERE u IS NULL LIMIT 1",
+                # Keyless parent table with incoming FK: UPDATE IGNORE fails FK RESTRICT on twins!
+                f"UPDATE IGNORE {t_par} SET k = 2, v = 9",
+                f"UPDATE {t_par} SET v = 6 WHERE k = 1 LIMIT 1",
+                # PK table with TIMESTAMP(3): skipped UPDATE IGNORE must NOT be applied!
+                f"UPDATE IGNORE {t_pkts} SET u = 20, v = 99 WHERE id = 1",
+                f"UPDATE {t_pkts} SET v = 6 WHERE id = 1",
+            ):
+                cur.execute(stmt)
+                _assert_all_exact(stmt)
+            conn.commit()
+            _assert_all_exact("post-commit")
+
+            # Out-of-band ADD UNIQUE on previously keyless table -> check_schema_drift reports drifted
+            # and re-registering (drop_view + register_view on MariaDB) installs the MariaDB guard.
+            cur.execute(f"ALTER TABLE {t_dr} ADD UNIQUE (u)")
+            conn.commit()
+            self.assertEqual(mgr.check_schema_drift().get(f"{tag}_v_dr"), "drifted")
+            conn.commit()
+            mgr.drop_view(f"{tag}_v_dr")
+            mgr.register_view(f"CREATE VIEW {tag}_v_dr AS {view_sqls[f'{tag}_v_dr']};")
+            conn.commit()
+            cur.execute(f"UPDATE IGNORE {t_dr} SET u = 2, v = 9 WHERE u IS NULL")
+            conn.commit()
+            _assert_all_exact("after drift re-register + UPDATE IGNORE")
+        finally:
+            conn.rollback()
+            try:
+                cur.execute(f"DROP TRIGGER IF EXISTS {tag}_usr_bu")
+            except Exception:
+                conn.rollback()
+            for vn in views:
+                try:
+                    mgr.drop_view(vn)
+                except Exception:
+                    conn.rollback()
+            for tbl in (t_chd, t_par, t_ty, t_j, t_bu, t_dr, f"{tag}_pkts"):
+                try:
+                    cur.execute(f"DROP TABLE IF EXISTS {tbl}")
+                except Exception:
+                    conn.rollback()
+            conn.commit()
+            cur.close()
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -895,6 +895,76 @@ MUTANTS = (
             "test_postgres_stable_and_session_dependent_exprs_refused_offline"
         ),
     ),
+    Mutant(
+        name="mariadb-nullable-unique-skips-before-count",
+        source_path="matview/dialects/emitters.py",
+        original="            if not mysql_prelock and not bu_count_stmt:\n                return [trig_ins, trig_del, trig_upd], t_names, []",
+        replacement="            if not mysql_prelock:\n                return [trig_ins, trig_del, trig_upd], t_names, []",
+        target_test=(
+            "test_p1_engine_codegen.TestMariaDBUpdateIgnoreGuard."
+            "test_mariadb_update_ignore_guard_codegen_shapes"
+        ),
+    ),
+    Mutant(
+        name="mariadb-nullable-unique-applies-null-unconditionally",
+        source_path="matview/dialects/emitters.py",
+        original="                            else_expr = f\"(({new_all_have_null}) OR {after_count_lt})\"",
+        replacement="                            else_expr = \"TRUE\"",
+        target_test=(
+            "test_p1_engine_codegen.TestMariaDBUpdateIgnoreGuard."
+            "test_mariadb_update_ignore_guard_codegen_shapes"
+        ),
+    ),
+    Mutant(
+        name="mariadb-second-nullable-unique-ignored",
+        source_path="matview/dialects/emitters.py",
+        original="                        for uq in nullable_uniques:",
+        replacement="                        for uq in nullable_uniques[:1]:",
+        target_test=(
+            "test_p1_engine_codegen.TestMariaDBUpdateIgnoreGuard."
+            "test_mariadb_update_ignore_guard_codegen_shapes"
+        ),
+    ),
+    Mutant(
+        name="mariadb-keyless-fk-guard-omitted",
+        source_path="matview/dialects/emitters.py",
+        original="                elif nullable_uniques or has_nonkey_skip:",
+        replacement="                elif nullable_uniques:",
+        target_test=(
+            "test_p1_engine_codegen.TestMariaDBUpdateIgnoreGuard."
+            "test_mariadb_update_ignore_guard_codegen_shapes"
+        ),
+    ),
+    Mutant(
+        name="mariadb-partitioned-guard-omitted",
+        source_path="matview/dialects/emitters.py",
+        original='            or getattr(t_schema, "is_partitioned", False)',
+        replacement="            or False",
+        target_test=(
+            "test_p1_engine_codegen.TestMariaDBUpdateIgnoreGuard."
+            "test_mariadb_update_ignore_guard_codegen_shapes"
+        ),
+    ),
+    Mutant(
+        name="mariadb-nullable-unique-nonkey-skip-shortcircuit-not-disabled",
+        source_path="matview/dialects/emitters.py",
+        original="                        if not has_nonkey_skip:",
+        replacement="                        if True:",
+        target_test=(
+            "test_p1_engine_codegen.TestMariaDBUpdateIgnoreGuard."
+            "test_mariadb_update_ignore_guard_codegen_shapes"
+        ),
+    ),
+    Mutant(
+        name="mariadb-timestamp-binary-cast-bug-reintroduced",
+        source_path="matview/dialects/emitters.py",
+        original='                if dt_head in ("TIMESTAMP", "DATETIME", "TIME", "DATE", "YEAR"):',
+        replacement='                if dt_head in ("DATETIME", "TIME", "DATE", "YEAR"):',
+        target_test=(
+            "test_p1_engine_codegen.TestMariaDBUpdateIgnoreGuard."
+            "test_mariadb_update_ignore_guard_codegen_shapes"
+        ),
+    ),
 )
 
 

@@ -6,7 +6,7 @@ import copy
 import dataclasses
 import re
 import sqlite3
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import create_engine as _sa_create_engine, event as _sa_event, inspect as _sa_inspect
 from sqlalchemy.engine import Connection as _SAConnection, Engine as _SAEngine
@@ -887,6 +887,37 @@ def introspect_schemas_with_sqlalchemy(
         )
 
         schemas: Dict[str, TableSchema] = {}
+        fk_tables_sa: Set[str] = set()
+        partitioned_tables_sa: Set[str] = set()
+        default_schema_low = str(getattr(insp, "default_schema_name", "") or "").strip().lower()
+        if eff_dialect == Dialect.MYSQL:
+            from sqlalchemy import text as _sa_text
+            _my_part_sql = _sa_text(
+                "SELECT DISTINCT table_name FROM information_schema.partitions "
+                "WHERE table_schema = DATABASE() AND partition_name IS NOT NULL"
+            )
+            _my_inc_fk_sql = _sa_text(
+                "SELECT DISTINCT referenced_table_name FROM information_schema.referential_constraints "
+                "WHERE unique_constraint_schema = DATABASE() AND referenced_table_name IS NOT NULL"
+            )
+            try:
+                if isinstance(insp_target, _SAConnection):
+                    for r in insp_target.execute(_my_part_sql).fetchall():
+                        if r and r[0]:
+                            partitioned_tables_sa.add(str(r[0]).lower())
+                    for r in insp_target.execute(_my_inc_fk_sql).fetchall():
+                        if r and r[0]:
+                            fk_tables_sa.add(str(r[0]).lower())
+                else:
+                    with insp_target.connect() as _tmp_c:
+                        for r in _tmp_c.execute(_my_part_sql).fetchall():
+                            if r and r[0]:
+                                partitioned_tables_sa.add(str(r[0]).lower())
+                        for r in _tmp_c.execute(_my_inc_fk_sql).fetchall():
+                            if r and r[0]:
+                                fk_tables_sa.add(str(r[0]).lower())
+            except Exception:
+                pass
         for t_name in insp.get_table_names():
             if t_name.startswith(("__matview_", "__mv_")) or (
                 object_prefix and t_name.startswith(object_prefix)
@@ -928,7 +959,14 @@ def introspect_schemas_with_sqlalchemy(
                 )
 
             fk_actions: List[str] = []
-            for fk in (insp.get_foreign_keys(t_name) or []):
+            sa_fks = insp.get_foreign_keys(t_name) or []
+            if sa_fks:
+                fk_tables_sa.add(t_name.lower())
+            for fk in sa_fks:
+                ref_tbl = str(fk.get("referred_table") or "").strip().lower()
+                ref_schema = str(fk.get("referred_schema") or "").strip().lower()
+                if ref_tbl and (not ref_schema or not default_schema_low or ref_schema == default_schema_low):
+                    fk_tables_sa.add(ref_tbl)
                 opts = fk.get("options") or {}
                 for opt_key, sql_kw in (("ondelete", "ON DELETE"), ("onupdate", "ON UPDATE")):
                     act_val = str(opts.get(opt_key) or "").strip().upper()
@@ -993,9 +1031,26 @@ def introspect_schemas_with_sqlalchemy(
                 name=t_name,
                 columns=col_defs,
                 fk_cascade_actions=tuple(sorted(fk_actions)),
+                has_foreign_keys=(t_name.lower() in fk_tables_sa),
+                is_partitioned=(t_name.lower() in partitioned_tables_sa),
                 indexes=tuple(idx_defs),
                 pk_columns=pk_cols_seq,
             )
+        if fk_tables_sa:
+            for t_key, existing_ts in list(schemas.items()):
+                if t_key.lower() in fk_tables_sa and not existing_ts.has_foreign_keys:
+                    schemas[t_key] = TableSchema(
+                        name=existing_ts.name,
+                        columns=existing_ts.columns,
+                        fk_cascade_actions=existing_ts.fk_cascade_actions,
+                        has_foreign_keys=True,
+                        is_partitioned=existing_ts.is_partitioned,
+                        has_on_conflict_replace=existing_ts.has_on_conflict_replace,
+                        indexes=existing_ts.indexes,
+                        pk_columns=existing_ts.pk_columns,
+                        without_rowid=existing_ts.without_rowid,
+                        strict=existing_ts.strict,
+                    )
         return schemas
     finally:
         if owned_engine is not None:
@@ -1094,6 +1149,8 @@ def introspect_sqlite_schemas(
                         name=existing.name,
                         columns=existing.columns,
                         fk_cascade_actions=live_fks,
+                        has_foreign_keys=existing.has_foreign_keys,
+                        is_partitioned=existing.is_partitioned,
                         has_on_conflict_replace=existing.has_on_conflict_replace,
                         indexes=existing.indexes,
                         pk_columns=existing.pk_columns,
@@ -1386,26 +1443,54 @@ def introspect_database_schemas(
         # Fail closed when FK metadata cannot be read: swallowing errors here
         # would silently bypass MYSQL_FK_CASCADE_NO_TRIGGER.
         fk_by_table_my: Dict[str, List[str]] = {}
+        fk_tables_my: Set[str] = set()
         cur.execute(
             """
-            SELECT rc.table_name, rc.delete_rule, rc.update_rule
+            SELECT rc.constraint_schema, rc.table_name, rc.unique_constraint_schema,
+                   rc.referenced_table_name, rc.delete_rule, rc.update_rule, DATABASE()
             FROM information_schema.referential_constraints rc
             WHERE rc.constraint_schema = DATABASE()
+               OR rc.unique_constraint_schema = DATABASE()
             """
         )
         for fk_r in (cur.fetchall() or []):
-            t_low = _dec(fk_r[0]).lower()
-            del_r = _dec(fk_r[1]).upper()
-            upd_r = _dec(fk_r[2]).upper()
-            acts = fk_by_table_my.setdefault(t_low, [])
-            if del_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                a_str = f"ON DELETE {del_r}"
-                if a_str not in acts:
-                    acts.append(a_str)
-            if upd_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
-                a_str = f"ON UPDATE {upd_r}"
-                if a_str not in acts:
-                    acts.append(a_str)
+            c_schema_low = _dec(fk_r[0]).lower()
+            t_low = _dec(fk_r[1]).lower()
+            u_schema_low = _dec(fk_r[2]).lower()
+            ref_low = _dec(fk_r[3]).lower()
+            del_r = _dec(fk_r[4]).upper()
+            upd_r = _dec(fk_r[5]).upper()
+            cur_db_low = _dec(fk_r[6]).lower()
+            if c_schema_low == cur_db_low and t_low:
+                fk_tables_my.add(t_low)
+                acts = fk_by_table_my.setdefault(t_low, [])
+                if del_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                    a_str = f"ON DELETE {del_r}"
+                    if a_str not in acts:
+                        acts.append(a_str)
+                if upd_r in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                    a_str = f"ON UPDATE {upd_r}"
+                    if a_str not in acts:
+                        acts.append(a_str)
+            if u_schema_low == cur_db_low and ref_low:
+                fk_tables_my.add(ref_low)
+
+        partitioned_tables_my: Set[str] = set()
+        try:
+            cur.execute(
+                """
+                SELECT DISTINCT table_name
+                FROM information_schema.partitions
+                WHERE table_schema = DATABASE()
+                  AND partition_name IS NOT NULL
+                """
+            )
+            for p_r in (cur.fetchall() or []):
+                p_low = _dec(p_r[0]).lower()
+                if p_low:
+                    partitioned_tables_my.add(p_low)
+        except Exception:
+            pass
 
         cur.execute(
             """
@@ -1505,6 +1590,8 @@ def introspect_database_schemas(
                 name=t_name,
                 columns=cols,
                 fk_cascade_actions=tuple(sorted(fk_by_table_my.get(t_name.lower(), ()))),
+                has_foreign_keys=(t_name.lower() in fk_tables_my),
+                is_partitioned=(t_name.lower() in partitioned_tables_my),
                 indexes=tuple(my_idx_by_table.get(t_name.lower(), ())),
                 pk_columns=tuple(my_pk_by_table.get(t_name.lower(), ())),
             )
