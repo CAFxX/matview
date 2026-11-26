@@ -1377,20 +1377,32 @@ def test_unsupported_key_type_fails_closed(make_env) -> None:
     env = make_env(views=[], seed=False, schema_sql=[
         "CREATE TABLE cp (id INT PRIMARY KEY, a INT, v INT)",
     ])
+    from matview import UnsupportedMaterializedViewError
+
     # 1. Anonymous `record` grouping key (including positional GROUP BY 1 and
-    #    SELECT DISTINCT): refused at registration, not at first write.
-    rec_views = [
+    #    SELECT DISTINCT): output-record views are refused explicitly with
+    #    UnsupportedMaterializedViewError; key-only record views are refused at
+    #    registration (0A000) even when the source table is empty.
+    rec_key_only_views = [
         ViewDef("v_rec_grp", "SELECT COUNT(*) AS n, SUM(v) AS s FROM cp GROUP BY ROW(a, v)"),
-        ViewDef("v_rec_pos", "SELECT ROW(a, v) AS r, COUNT(*) AS n FROM cp GROUP BY 1"),
-        ViewDef("v_rec_dst", "SELECT DISTINCT ROW(a, v) AS r FROM cp"),
         ViewDef("v_rec_win", "SELECT id, ROW_NUMBER() OVER (PARTITION BY ROW(a, v) ORDER BY id) AS rn FROM cp"),
     ]
-    for vd in rec_views:
+    for vd in rec_key_only_views:
         with pytest.raises(Exception) as excinfo:
             env.register(vd)
         env.conn.rollback()
         assert _pgcode(excinfo.value) == "0A000", (vd.name, repr(excinfo.value))
         assert "record" in str(excinfo.value).lower(), (vd.name, str(excinfo.value))
+
+    rec_output_views = [
+        ViewDef("v_rec_pos", "SELECT ROW(a, v) AS r, COUNT(*) AS n FROM cp GROUP BY 1"),
+        ViewDef("v_rec_dst", "SELECT DISTINCT ROW(a, v) AS r FROM cp"),
+    ]
+    for vd in rec_output_views:
+        with pytest.raises(UnsupportedMaterializedViewError) as excinfo_u:
+            env.register(vd)
+        env.conn.rollback()
+        assert "record" in str(excinfo_u.value).lower(), (vd.name, str(excinfo_u.value))
 
     # 2. Composite / nested composite / domain / array / custom range containing
     #    a nondeterministic collation (including output-alias shadowing): refused
@@ -1568,11 +1580,24 @@ def test_unsupported_key_type_fails_closed(make_env) -> None:
             "SELECT DISTINCT a, LAG(ROW(a, v)) OVER (PARTITION BY a ORDER BY id) AS lv FROM cp",
         ),
     ]
+    complex_rec_output_names = frozenset({
+        "v_cte_rec_dst",
+        "v_sub_rec_dst",
+        "v_using_rec_dst",
+        "v_union_rec",
+        "v_intersect_rec",
+        "v_except_rec",
+        "v_cte_union_rec",
+        "v_dist_lag_rec",
+    })
     for vd in complex_rec_views:
         with pytest.raises(Exception) as excinfo:
             env.register(vd)
         env.conn.rollback()
-        assert _pgcode(excinfo.value) == "0A000", (vd.name, repr(excinfo.value))
+        if vd.name in complex_rec_output_names:
+            assert isinstance(excinfo.value, UnsupportedMaterializedViewError), (vd.name, repr(excinfo.value))
+        else:
+            assert _pgcode(excinfo.value) == "0A000", (vd.name, repr(excinfo.value))
         assert "record" in str(excinfo.value).lower(), (vd.name, str(excinfo.value))
 
     # Nested nondeterministic composite constructed via expression inside CTE,
@@ -1598,7 +1623,7 @@ def test_unsupported_key_type_fails_closed(make_env) -> None:
         ),
         ViewDef(
             "v_minmax_nd_comp",
-            "SELECT a, MIN(ROW(a, v::text)::ci_leaf) AS m FROM cp GROUP BY a",
+            "SELECT a, MIN(ROW(a, v::text)::ci_leaf)::TEXT AS m FROM cp GROUP BY a",
         ),
         ViewDef(
             "v_having_min_nd_comp",

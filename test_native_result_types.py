@@ -3428,5 +3428,153 @@ class ExactWindowExpressionTypesTests(unittest.TestCase):
                     )
 
 
+class PostgresPseudotypeOutputRefusalTests(unittest.TestCase):
+    """PostgreSQL forbids pseudo-type columns (such as anonymous ``record`` /
+    ``record[]`` from ``ROW(v, g)`` or ``(v, g)``) in tables and views; matview
+    must refuse them explicitly instead of silently storing a ``TEXT`` column."""
+
+    def test_postgres_row_and_pseudotype_outputs_refused_offline(self) -> None:
+        schema = "CREATE TABLE t (id INT PRIMARY KEY, g INT, v TEXT);"
+        refused = (
+            "SELECT id, ROW(v, g) AS r FROM t",
+            "SELECT id, (v, g) AS r FROM t",
+            "SELECT id, ROW() AS r FROM t",
+            "SELECT id, ARRAY[ROW(v, g)] AS r FROM t",
+            "SELECT id, COALESCE(ROW(v, g), ROW('a', 1)) AS r FROM t",
+            "SELECT id, CASE WHEN g > 0 THEN ROW(v, g) ELSE NULL END AS r FROM t",
+            "SELECT id, NULLIF(ROW(v, g), ROW('a', 1)) AS r FROM t",
+            "SELECT g, MIN(ROW(v, g)) AS r FROM t GROUP BY g",
+            "SELECT g, MAX(ROW(v, g)) AS r FROM t GROUP BY g",
+            "SELECT g, ARRAY_AGG(ROW(v, g) ORDER BY id) AS r FROM t GROUP BY g",
+            "SELECT id, LAG(ROW(v, g)) OVER (PARTITION BY g ORDER BY id) AS r FROM t",
+            "SELECT id, CAST(v AS record) AS r FROM t",
+            "SELECT id, CAST(v AS record[]) AS r FROM t",
+            "SELECT id, CAST(v AS pg_catalog.record) AS r FROM t",
+            "WITH c AS (SELECT id, ROW(v, g) AS rk FROM t) SELECT id, rk FROM c",
+            "SELECT NULL AS r FROM t UNION SELECT ROW(v, g) AS r FROM t",
+        )
+        for sel in refused:
+            with self.subTest(refused=sel):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    with self.assertRaises(UnsupportedMaterializedViewError) as ctx:
+                        generate_materialized_view(schema, f"CREATE VIEW v AS {sel};", dialect="postgres:18")
+                self.assertIn("record", str(ctx.exception).lower())
+                self.assertIn("pseudo-type", str(ctx.exception).lower())
+
+        # Valid casts and boolean comparisons over ROW(...) must remain supported
+        # with their exact PostgreSQL storage types.
+        allowed = (
+            ("SELECT id, ROW(v, g)::my_pair AS r FROM t", "r my_pair"),
+            ("SELECT id, ROW(v, g)::text AS r FROM t", "r TEXT"),
+            ("SELECT id, (ROW(v, g) = ROW('a', 1)) AS r FROM t", "r BOOLEAN"),
+            ("SELECT id, ROW(v, g) IS NULL AS r FROM t", "r BOOLEAN"),
+            ("SELECT id, NULL AS r FROM t", "r TEXT"),
+        )
+        for sel, exp_col_ddl in allowed:
+            with self.subTest(allowed=sel):
+                plan = generate_materialized_view(schema, f"CREATE VIEW v AS {sel};", dialect="postgres:18")
+                self.assertIn(exp_col_ddl, plan.backing_table_ddl)
+
+    def test_native_postgres_row_and_pseudotype_outputs_refused_and_named_composite_exact(self) -> None:
+        import os
+
+        dsn = os.environ.get("POSTGRES_DSN")
+        if not dsn:
+            self.skipTest("POSTGRES_DSN not set")
+        tag = f"pgrec_{uuid.uuid4().hex[:8]}"
+        t = f"t_{tag}"
+        pair_t = f"pair_{tag}"
+        fn_rec = f"mk_rec_{tag}"
+        conn = _connect(Dialect.POSTGRES, dsn)
+        cur = conn.cursor()
+        created_mvs: List[str] = []
+        created_lvs: List[str] = []
+        try:
+            cur.execute(f"CREATE TYPE {pair_t} AS (v text, g int)")
+            cur.execute(f"CREATE TABLE {t} (id INT PRIMARY KEY, g INT, v TEXT)")
+            cur.execute(
+                f"CREATE FUNCTION {fn_rec}(int) RETURNS record LANGUAGE sql IMMUTABLE "
+                f"AS $$ SELECT ROW($1, 'x') $$"
+            )
+            cur.execute(f"INSERT INTO {t} VALUES (1, 10, 'a'), (2, 20, 'b'), (3, NULL, NULL)")
+            conn.commit()
+
+            mgr = MaterializedViewManager(conn, dialect=Dialect.POSTGRES)
+            for idx, bad_sel in enumerate(
+                (
+                    f"SELECT id, ROW(v, g) AS r FROM {t}",
+                    f"SELECT id, (v, g) AS r FROM {t}",
+                    f"SELECT id, ARRAY[ROW(v, g)] AS r FROM {t}",
+                    f"SELECT g, MIN(ROW(v, g)) AS r FROM {t} GROUP BY g",
+                    f"SELECT g, MIN(ROW(v, g)::{pair_t}) AS r FROM {t} GROUP BY g",
+                    f"SELECT id, {fn_rec}(id) AS r FROM {t}",
+                    f"SELECT id, COALESCE({fn_rec}(id), NULL) AS r FROM {t}",
+                )
+            ):
+                with self.subTest(refused_native=bad_sel):
+                    with self.assertRaises(UnsupportedMaterializedViewError) as ctx:
+                        mgr.register_view(f"CREATE VIEW mv_bad_{idx}_{tag} AS {bad_sel};")
+                    conn.rollback()
+                    self.assertIn("record", str(ctx.exception).lower())
+
+            good_specs = [
+                ("named_comp", f"SELECT id, ROW(v, g)::{pair_t} AS r FROM {t}"),
+                ("row_text", f"SELECT id, ROW(v, g)::text AS rt FROM {t}"),
+                ("row_eq", f"SELECT id, (ROW(v, g) = ROW('a', 10)) AS eq FROM {t}"),
+            ]
+            pairs = []
+            for label, sel in good_specs:
+                mv, lv = f"mv_{label}_{tag}", f"lv_{label}_{tag}"
+                mgr.register_view(f"CREATE VIEW {mv} AS {sel};")
+                conn.commit()
+                created_mvs.append(mv)
+                cur.execute(f"CREATE VIEW {lv} AS {sel}")
+                conn.commit()
+                created_lvs.append(lv)
+                pairs.append((label, mv, lv))
+
+            def check(step: str) -> None:
+                for label, mv, lv in pairs:
+                    cur.execute(f"SELECT * FROM {mv} ORDER BY id")
+                    got = [tuple(_exact(v) for v in r) for r in cur.fetchall()]
+                    da = _description(cur)
+                    cur.execute(f"SELECT * FROM {lv} ORDER BY id")
+                    exp = [tuple(_exact(v) for v in r) for r in cur.fetchall()]
+                    db = _description(cur)
+                    cat_mv = _catalog_types(Dialect.POSTGRES, cur, mv)
+                    cat_lv = _catalog_types(Dialect.POSTGRES, cur, lv)
+                    conn.commit()
+                    self.assertEqual(got, exp, f"PG {label} {step}: {got} != {exp}")
+                    self.assertEqual(_metadata_mismatches(Dialect.POSTGRES, da, db), [], f"PG {label} {step} meta")
+                    self.assertEqual(cat_mv, cat_lv, f"PG {label} {step} catalog: {cat_mv} != {cat_lv}")
+
+            check("initial")
+            cur.execute(f"INSERT INTO {t} VALUES (4, 30, 'c')")
+            cur.execute(f"UPDATE {t} SET v = 'aa', g = 11 WHERE id = 1")
+            conn.commit()
+            check("after_ins_upd")
+            cur.execute(f"INSERT INTO {t} VALUES (99, 99, 'rb')")
+            conn.rollback()
+            check("after_rollback")
+            cur.execute(f"DELETE FROM {t} WHERE id = 2")
+            conn.commit()
+            check("after_delete")
+        finally:
+            conn.rollback()
+            for mv in created_mvs:
+                try:
+                    MaterializedViewManager(conn, dialect=Dialect.POSTGRES).drop_view(mv)
+                except Exception:
+                    conn.rollback()
+            for lv in created_lvs:
+                cur.execute(f"DROP VIEW IF EXISTS {lv}")
+            cur.execute(f"DROP TABLE IF EXISTS {t} CASCADE")
+            cur.execute(f"DROP FUNCTION IF EXISTS {fn_rec}(int)")
+            cur.execute(f"DROP TYPE IF EXISTS {pair_t}")
+            conn.commit()
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

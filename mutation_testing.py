@@ -735,6 +735,26 @@ MUTANTS = (
             "test_temporal_precision_introspection_and_expression_types"
         ),
     ),
+    Mutant(
+        name="pg-row-pseudotype-output-not-refused",
+        source_path="matview/planner.py",
+        original="        if self.dialect == Dialect.POSTGRES:\n            self._enforce_pg_no_pseudotype_outputs()",
+        replacement="        if False and self.dialect == Dialect.POSTGRES:\n            self._enforce_pg_no_pseudotype_outputs()",
+        target_test=(
+            "test_native_result_types.PostgresPseudotypeOutputRefusalTests."
+            "test_postgres_row_and_pseudotype_outputs_refused_offline"
+        ),
+    ),
+    Mutant(
+        name="pg-tuple-row-constructor-not-record",
+        source_path="matview/dialects/base.py",
+        original='                if kind == "Tuple":\n                    return "RECORD"',
+        replacement='                if False and kind == "Tuple":\n                    return "RECORD"',
+        target_test=(
+            "test_native_result_types.PostgresPseudotypeOutputRefusalTests."
+            "test_postgres_row_and_pseudotype_outputs_refused_offline"
+        ),
+    ),
 )
 
 
