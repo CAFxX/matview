@@ -1541,32 +1541,40 @@ def test_pg_timestamptz_expression_independent_of_writer_session_settings(make_e
 
 @pytest.mark.parametrize("target", _params(("postgres",)))
 @pytest.mark.parametrize(
-    "expr",
+    "view_sql",
     [
-        "to_jsonb(t)::text",
-        "to_jsonb(t.*)::text",
-        "(t).junk",
-        "((t)).junk",
-        "junk(t)",
-        "t::text",
-        "ctid::text",
-        "t.ctid::text",
-        "xmin::text",
-        "xmax::text",
-        "cmin::text",
-        "cmax::text",
-        "tableoid::regclass::text",
+        "SELECT id, to_jsonb(t)::text AS e FROM t",
+        "SELECT id, to_jsonb(t.*)::text AS e FROM t",
+        "SELECT id, (t).junk AS e FROM t",
+        "SELECT id, ((t)).junk AS e FROM t",
+        "SELECT id, row_to_json(t)::text AS e FROM t",
+        "SELECT id, t::text AS e FROM t",
+        "SELECT id, ctid::text AS e FROM t",
+        "SELECT id, t.ctid::text AS e FROM t",
+        "SELECT id, xmin::text AS e FROM t",
+        "SELECT id, xmax::text AS e FROM t",
+        "SELECT id, cmin::text AS e FROM t",
+        "SELECT id, cmax::text AS e FROM t",
+        "SELECT id, tableoid::regclass::text AS e FROM t",
+        "SELECT id FROM t WHERE ctid > '(0,0)'",
+        "SELECT t.id, x.k FROM t CROSS JOIN LATERAL jsonb_each(to_jsonb(t)) AS x(k, v)",
+        "SELECT id FROM t UNION SELECT id FROM t LIMIT (SELECT COUNT(ctid) FROM t)",
     ],
 )
-def test_pg_whole_row_and_system_column_refs_are_refused_or_maintained(make_env, target: Target, expr: str) -> None:
+def test_pg_whole_row_and_system_column_refs_are_refused_or_maintained(make_env, target: Target, view_sql: str) -> None:
     """Whole-row references and PostgreSQL system columns must be refused at
     registration (never installed in a broken state that fails later base-table
     UPDATEs with UndefinedColumn)."""
-    env = make_env(target, views=[], schema_sql=["CREATE TABLE t (id INT PRIMARY KEY, g INT, junk INT)"], seed=False)
-    env.execute("INSERT INTO t SELECT i, i % 3, 0 FROM generate_series(1, 9) i")
+    env = make_env(
+        target,
+        views=[],
+        schema_sql=['CREATE TABLE t (id INT PRIMARY KEY, g INT, junk INT, "CTID" INT, "T" INT)'],
+        seed=False,
+    )
+    env.execute("INSERT INTO t SELECT i, i % 3, 0, i, i FROM generate_series(1, 9) i")
     env.commit()
-    vd = ViewDef("v_whole_row", f"SELECT id, {expr} AS e FROM t", ("postgres",))
-    with pytest.raises(UnsupportedMaterializedViewError):
+    vd = ViewDef("v_whole_row", view_sql, ("postgres",))
+    with pytest.raises(UnsupportedMaterializedViewError, match=r"(?i)whole-row|system column"):
         env.register(vd)
     env.conn.rollback()
     # Base-table writes remain completely healthy after the refused registration.

@@ -3653,7 +3653,7 @@ class PostgresWholeRowAndSystemColumnRefusalTests(unittest.TestCase):
 
     def test_postgres_whole_row_and_system_columns_refused_offline(self) -> None:
         schema = (
-            "CREATE TABLE t (id INT PRIMARY KEY, g INT, junk INT);"
+            'CREATE TABLE t (id INT PRIMARY KEY, g INT, junk INT, "CTID" INT, "Ctid" INT, "T" INT);'
             "CREATE TABLE t2 (id INT PRIMARY KEY, x INT);"
         )
         refused = (
@@ -3675,6 +3675,20 @@ class PostgresWholeRowAndSystemColumnRefusalTests(unittest.TestCase):
             ("whole-row", "WITH c AS (SELECT id, to_jsonb(t)::text AS e FROM t) SELECT id, e FROM c"),
             ("whole-row", "WITH c AS (SELECT id, g FROM t) SELECT id, to_jsonb(c)::text AS e FROM c"),
             ("whole-row", "SELECT id, to_jsonb(s)::text AS e FROM (SELECT id, g FROM t) s"),
+            # LATERAL / UNNEST / ROWS FROM / VALUES / parenthesized joins / outer modifiers
+            ("whole-row", "SELECT t.id, x.k FROM t CROSS JOIN LATERAL jsonb_each(to_jsonb(t)) AS x(k, v)"),
+            ("whole-row", "SELECT t.id, x.k FROM t, LATERAL jsonb_each(to_jsonb(t)) AS x(k, v)"),
+            ("whole-row", "SELECT t.id, x.k FROM t LEFT JOIN LATERAL jsonb_each(to_jsonb(t)) AS x(k, v) ON true"),
+            ("whole-row", "SELECT t.id, x.k FROM t, ROWS FROM (jsonb_each(to_jsonb(t))) AS x(k, v)"),
+            ("whole-row", "SELECT t.id, to_jsonb(s)::text AS e FROM t, LATERAL (SELECT t.g) AS s"),
+            ("whole-row", 'SELECT t.id, to_jsonb(x)::text AS e FROM t CROSS JOIN LATERAL jsonb_each_text(\'{"a":"1"}\'::jsonb) AS x(k, v)'),
+            ("whole-row", "SELECT id FROM t UNION SELECT id FROM t OFFSET (SELECT COUNT(to_jsonb(t)) FROM t)"),
+            ("whole-row", "SELECT t.id, to_jsonb(t)::text AS e FROM (t JOIN t2 ON t.id = t2.id)"),
+            ("whole-row", "SELECT t.id, to_jsonb(t2)::text AS e FROM t JOIN (t2 JOIN t t3 ON t2.id = t3.id) ON t.id = t2.id"),
+            ("whole-row", "SELECT a.id, to_jsonb(a)::text AS e FROM (t AS a)"),
+            ("whole-row", 'SELECT a.id, to_jsonb(a)::text AS e FROM t AS a(id, "A", junk)'),
+            ("whole-row", 'SELECT id, to_jsonb("t")::text AS e FROM t'),
+            ("whole-row", "SELECT id AS t, COUNT(*) AS c FROM t GROUP BY (t)"),
             ("system column", "SELECT id, ctid FROM t"),
             ("system column", "SELECT id, ctid::text AS e FROM t"),
             ("system column", "SELECT g, COUNT(ctid) AS c FROM t GROUP BY g"),
@@ -3692,6 +3706,25 @@ class PostgresWholeRowAndSystemColumnRefusalTests(unittest.TestCase):
             ("system column", "SELECT a.id FROM t a JOIN t2 b ON a.id = b.id AND a.xmin::text <> ''"),
             ("system column", "WITH c AS (SELECT id, ctid FROM t) SELECT id FROM c"),
             ("system column", "SELECT id FROM t UNION SELECT id FROM t WHERE xmax::text <> ''"),
+            ("system column", "SELECT t.id, x.v FROM t, LATERAL unnest(ARRAY[ctid::text]) AS x(v)"),
+            ("system column", "SELECT t.id, x.v FROM t, unnest(ARRAY[ctid::text]) AS x(v)"),
+            ("system column", "SELECT t.id, v.x FROM t CROSS JOIN LATERAL (VALUES (ctid::text)) AS v(x)"),
+            ("system column", "SELECT t.id, v.x FROM t, LATERAL (VALUES (t.ctid::text)) v(x)"),
+            ("system column", "WITH c(x) AS (VALUES ((SELECT COUNT(ctid) FROM t))) SELECT t.id FROM t CROSS JOIN c"),
+            ("system column", "SELECT id FROM t UNION SELECT id FROM t ORDER BY (SELECT COUNT(ctid) FROM t)"),
+            ("system column", "SELECT id FROM t UNION SELECT id FROM t LIMIT (SELECT COUNT(ctid) FROM t)"),
+            ("system column", "SELECT id FROM t UNION SELECT id FROM t FETCH FIRST (SELECT COUNT(ctid) FROM t) ROWS ONLY"),
+            ("system column", "SELECT s.id FROM (SELECT id FROM t UNION SELECT id FROM t LIMIT (SELECT COUNT(ctid) FROM t)) s"),
+            ("system column", "SELECT s.id FROM ((SELECT id FROM t) ORDER BY (SELECT COUNT(ctid) FROM t)) s"),
+            ("system column", "SELECT t.id, t.ctid::text AS e FROM (t JOIN t2 ON t.id = t2.id)"),
+            ("system column", "SELECT t.id FROM (t JOIN t2 ON t.id = t2.id AND t.ctid > '(0,0)')"),
+            ("system column", "SELECT t.id, t2.ctid::text AS e FROM t JOIN (t2 JOIN t t3 ON t2.id = t3.id) ON t.id = t2.id"),
+            ("system column", "WITH c AS (SELECT id, g AS ctid FROM t) SELECT c.id, (SELECT ctid::text FROM t2 WHERE t2.id = c.id) AS e FROM c"),
+            ("system column", "WITH c AS (SELECT id, g AS ctid FROM t) SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM t2 WHERE ctid > '(0,0)')"),
+            ("system column", 'WITH "T" AS (SELECT id, x FROM t2) SELECT t.id, t.ctid::text AS e FROM t JOIN t2 ON t.id = t2.id'),
+            ("system column", 'WITH c(id, "CTID") AS (SELECT id, g FROM t) SELECT c.id, ctid::text AS e FROM c JOIN t ON c.id = t.id'),
+            ("system column", 'SELECT a.id, ctid::text AS e FROM t AS a(id, "CTID", junk)'),
+            ("system column", 'SELECT s.id, ctid::text AS e FROM (SELECT id, g AS "CTID" FROM t) s JOIN t ON s.id = t.id'),
         )
         for expected_phrase, sel in refused:
             with self.subTest(refused=sel):
@@ -3703,7 +3736,7 @@ class PostgresWholeRowAndSystemColumnRefusalTests(unittest.TestCase):
 
         # Positive controls must remain allowed.
         pos_schema = (
-            'CREATE TABLE t (id INT PRIMARY KEY, t INT, g INT, "CTID" INT, p my_pair);'
+            'CREATE TABLE t (id INT PRIMARY KEY, t INT, s INT, a INT, g INT, "CTID" INT, p my_pair);'
             "CREATE TABLE t2 (id INT PRIMARY KEY, g INT);"
         )
         allowed = (
@@ -3715,6 +3748,18 @@ class PostgresWholeRowAndSystemColumnRefusalTests(unittest.TestCase):
             "SELECT COUNT(*) AS c FROM t",
             "SELECT id AS t2 FROM t2 ORDER BY t2",
             "SELECT id AS t FROM t ORDER BY t",
+            "SELECT id AS t2, COUNT(*) AS c FROM t2 GROUP BY ROLLUP (t2)",
+            "SELECT id AS t2, COUNT(*) AS c FROM t2 GROUP BY CUBE (t2)",
+            "SELECT id AS t2, COUNT(*) AS c FROM t2 GROUP BY GROUPING SETS ((t2), ())",
+            "SELECT id, s FROM (SELECT * FROM t) s",
+            "WITH s AS (SELECT * FROM t) SELECT id, s FROM s",
+            "SELECT id, s FROM (SELECT t.* FROM t) s",
+            "SELECT id, t FROM (SELECT * FROM t) t",
+            "SELECT a.x, a FROM t AS a(x) JOIN t2 ON a.x = t2.id",
+            "WITH c1 AS (SELECT id, g AS ctid FROM t), c2 AS (SELECT * FROM c1) SELECT c2.id, ctid AS x FROM c2 JOIN t2 ON c2.id = t2.id",
+            "WITH c1 AS (SELECT id, g AS t2 FROM t), c2 AS (SELECT * FROM c1) SELECT c2.id, t2 AS x FROM c2 JOIN t2 ON c2.id = t2.id",
+            "SELECT s.id, t2 AS x FROM (SELECT * FROM (SELECT id, g AS t2 FROM t) inner_s) s JOIN t2 ON s.id = t2.id",
+            "WITH lower AS (SELECT DISTINCT id, LOWER(g::text) FROM t) SELECT id, lower FROM lower",
             "WITH c AS (SELECT id, g AS ctid FROM t) SELECT id, ctid FROM c",
             "WITH c AS (SELECT id, g AS ctid FROM t) SELECT c.id, c.ctid FROM c",
             "SELECT t.id, t2.g FROM t JOIN t2 USING (id)",
