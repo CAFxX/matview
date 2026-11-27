@@ -1358,7 +1358,9 @@ def introspect_database_schemas(
             fk_tables_pg: Set[str] = set()
             cur.execute(
                 """
-                SELECT c.relname, con.confdeltype, con.confupdtype, rc.relname
+                SELECT c.relname, con.confdeltype, con.confupdtype, rc.relname,
+                       (n.nspname = current_schema()) AS child_local,
+                       (rn.nspname = current_schema()) AS parent_local
                 FROM pg_catalog.pg_constraint con
                 JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -1369,21 +1371,24 @@ def introspect_database_schemas(
                 """
             )
             for fk_r in (cur.fetchall() or []):
+                child_local = bool(fk_r[4]) if len(fk_r) > 4 else True
+                parent_local = bool(fk_r[5]) if len(fk_r) > 5 else True
                 t_low = str(fk_r[0]).lower()
-                fk_tables_pg.add(t_low)
-                if len(fk_r) > 3 and fk_r[3]:
+                if child_local:
+                    fk_tables_pg.add(t_low)
+                    del_r = _norm_pg_fk_action(fk_r[1])
+                    upd_r = _norm_pg_fk_action(fk_r[2])
+                    acts = fk_by_table.setdefault(t_low, [])
+                    if del_r:
+                        a_str = f"ON DELETE {del_r}"
+                        if a_str not in acts:
+                            acts.append(a_str)
+                    if upd_r:
+                        a_str = f"ON UPDATE {upd_r}"
+                        if a_str not in acts:
+                            acts.append(a_str)
+                if parent_local and len(fk_r) > 3 and fk_r[3]:
                     fk_tables_pg.add(str(fk_r[3]).lower())
-                del_r = _norm_pg_fk_action(fk_r[1])
-                upd_r = _norm_pg_fk_action(fk_r[2])
-                acts = fk_by_table.setdefault(t_low, [])
-                if del_r:
-                    a_str = f"ON DELETE {del_r}"
-                    if a_str not in acts:
-                        acts.append(a_str)
-                if upd_r:
-                    a_str = f"ON UPDATE {upd_r}"
-                    if a_str not in acts:
-                        acts.append(a_str)
 
             pg_array_types = _pg_introspect_native_array_types(conn)
             pg_gen_cols = _pg_introspect_generated_columns(conn)

@@ -2186,8 +2186,9 @@ def _pg_default_function_col_name(node: sqlglot_exp.Expr, raw_expr: str) -> Opti
         ),
     ):
         return None
+    unwrapped_raw = _unwrap_outer_parens(raw_expr, dialect=Dialect.POSTGRES)
     try:
-        toks = _tokenize_sql(_unwrap_outer_parens(raw_expr, dialect=Dialect.POSTGRES), read="postgres")
+        toks = _tokenize_sql(unwrapped_raw, read="postgres")
     except sqlglot.errors.SqlglotError:
         toks = []
     if isinstance(cur, sqlglot_exp.Extract):
@@ -2207,7 +2208,7 @@ def _pg_default_function_col_name(node: sqlglot_exp.Expr, raw_expr: str) -> Opti
     elif i + 1 < len(toks) and toks[i + 1].token_type == SQLGlotTokenType.L_PAREN:
         fn_tok = toks[i]
     if fn_tok is not None:
-        raw_tok = raw_expr[fn_tok.start : fn_tok.end + 1] if 0 <= fn_tok.start <= fn_tok.end < len(raw_expr) else ""
+        raw_tok = unwrapped_raw[fn_tok.start : fn_tok.end + 1] if 0 <= fn_tok.start <= fn_tok.end < len(unwrapped_raw) else ""
         if len(raw_tok) >= 2 and raw_tok[0] == '"' and raw_tok[-1] == '"':
             unq = raw_tok[1:-1].replace('""', '"')
             return unq if unq else None
@@ -3273,7 +3274,7 @@ def _parse_single_create_view_stmt(
         # alias, a base column, or another unaliased call in the SELECT list.
         is_unaliased_fn_flags = [
             (
-                it.source_col is None
+                (it.is_aggregate or it.source_col is None)
                 and raw_p.strip() == it.raw_expr.strip()
                 and it.alias != f"col_{idx}"
             )
