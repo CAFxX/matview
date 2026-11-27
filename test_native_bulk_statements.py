@@ -1667,23 +1667,63 @@ def test_pg_numeric_representation_ties_complex_shapes(make_env, target: Target)
 ORDER_SCHEMA = ["CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT, s TEXT, x INT)"]
 
 
-@known_defect("pre-existing P0: window tie assignment differs from the live query (TODO.md)")
 @pytest.mark.parametrize("target", _params(("postgres",)))
 def test_pg_window_ties_unread_column_update_matches_live_view(make_env, target: Target) -> None:
-    """ROW_NUMBER() over ties in the ORDER BY key is assigned in scan order."""
-    env = make_env(target, views=[], schema_sql=ORDER_SCHEMA, seed=False)
+    """Tie-dependent window functions (ROW_NUMBER, NTILE, LAG, LEAD, FIRST_VALUE,
+    LAST_VALUE, NTH_VALUE, and non-whole-partition ROWS frames) without a total
+    ORDER BY route to exact full refresh so tied rows match the live query across
+    ctid-moving unread-column UPDATEs, while total-order and tie-independent
+    windows stay on Tier 2 group-scoped maintenance."""
+    from matview_sync import MaintenanceStrategy
+
+    schema = [
+        *ORDER_SCHEMA,
+        "CREATE TABLE tc (g INT NOT NULL, seq INT NOT NULL, v INT, x INT, PRIMARY KEY (g, seq))",
+    ]
+    env = make_env(target, views=[], schema_sql=schema, seed=False)
     env.execute("INSERT INTO t (id, g, v, s, x) SELECT i, i % 3, i % 4, 's' || i, 0 FROM generate_series(1, 30) i")
+    env.execute("INSERT INTO tc (g, seq, v, x) SELECT i % 3, i, i % 4, 0 FROM generate_series(1, 18) i")
     env.commit()
-    vd = ViewDef("v_order_rn", "SELECT id, g, v, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t", ("postgres",))
-    env.register(vd)
-    env.views.append(vd)
+    cases = [
+        # Tie-dependent without total ORDER BY -> Tier 3 exact full refresh
+        ("v_order_rn", "SELECT id, g, v, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t", MaintenanceStrategy.ATOMIC_QUERY_SYNC),
+        ("v_order_ntile", "SELECT id, g, v, NTILE(3) OVER (PARTITION BY g ORDER BY v) AS nt FROM t", MaintenanceStrategy.ATOMIC_QUERY_SYNC),
+        ("v_order_lag", "SELECT id, g, v, LAG(id) OVER (PARTITION BY g ORDER BY v) AS lg, LEAD(id) OVER (PARTITION BY g ORDER BY v) AS ld FROM t", MaintenanceStrategy.ATOMIC_QUERY_SYNC),
+        ("v_order_fln", "SELECT id, g, v, FIRST_VALUE(id) OVER (PARTITION BY g ORDER BY v) AS fv, LAST_VALUE(id) OVER (PARTITION BY g ORDER BY v) AS lv, NTH_VALUE(id, 2) OVER (PARTITION BY g ORDER BY v) AS nv FROM t", MaintenanceStrategy.ATOMIC_QUERY_SYNC),
+        ("v_order_rows", "SELECT id, g, v, SUM(id) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rs FROM t", MaintenanceStrategy.ATOMIC_QUERY_SYNC),
+        # Tie-independent or total ORDER BY -> Tier 2 partition-scoped recompute
+        ("v_total_rn", "SELECT id, g, v, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v, id) AS rn FROM t", MaintenanceStrategy.GROUP_SCOPED_DELTA),
+        ("v_ties_rank", "SELECT id, g, v, RANK() OVER (PARTITION BY g ORDER BY v) AS rk, DENSE_RANK() OVER (PARTITION BY g ORDER BY v) AS drk, PERCENT_RANK() OVER (PARTITION BY g ORDER BY v) AS prk, CUME_DIST() OVER (PARTITION BY g ORDER BY v) AS cd FROM t", MaintenanceStrategy.GROUP_SCOPED_DELTA),
+        ("v_range_sum", "SELECT id, g, v, SUM(id) OVER (PARTITION BY g ORDER BY v) AS rs FROM t", MaintenanceStrategy.GROUP_SCOPED_DELTA),
+        ("v_whole_rows_sum", "SELECT id, g, v, SUM(id) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS ws FROM t", MaintenanceStrategy.GROUP_SCOPED_DELTA),
+        ("v_total_rows_sum", "SELECT id, g, v, SUM(id) OVER (PARTITION BY g ORDER BY v, id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS trs FROM t", MaintenanceStrategy.GROUP_SCOPED_DELTA),
+        ("v_comp_pk_rn", "SELECT g, seq, v, ROW_NUMBER() OVER (PARTITION BY g ORDER BY seq) AS rn FROM tc", MaintenanceStrategy.GROUP_SCOPED_DELTA),
+    ]
+    for name, sql, expected_strategy in cases:
+        vd = ViewDef(name, sql, ("postgres",))
+        plan = env.register(vd)
+        assert plan.strategy == expected_strategy, f"{name}: got {plan.strategy}, expected {expected_strategy}"
+        env.views.append(vd)
     env.check("initial")
     env.execute("UPDATE t SET x = x + 1 WHERE id % 2 = 0")
+    env.execute("UPDATE tc SET x = x + 1 WHERE seq % 2 = 0")
     env.commit()
     env.check("unread-column update")
     env.execute("UPDATE t SET x = x + 1 WHERE id % 3 = 0")
     env.commit()
     env.check("second unread-column update")
+    env.execute("INSERT INTO t VALUES (31, 1, 2, 's31', 0), (32, 0, 0, 's32', 0)")
+    env.execute("INSERT INTO tc VALUES (1, 19, 2, 0)")
+    env.commit()
+    env.check("insert tied rows")
+    env.execute("DELETE FROM t WHERE id IN (2, 14, 26)")
+    env.execute("DELETE FROM tc WHERE seq = 4")
+    env.commit()
+    env.check("delete tied rows")
+    # Rollback must leave every materialized view equal to live.
+    env.execute("UPDATE t SET x = x + 99 WHERE g = 1")
+    env.conn.rollback()
+    env.check("after rollback")
 
 
 @pytest.mark.parametrize("target", _params(("postgres",)))

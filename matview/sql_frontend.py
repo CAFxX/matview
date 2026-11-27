@@ -1726,7 +1726,8 @@ def _unwrap_pg_catalog_agg_node(
     node: sqlglot_exp.Expr,
     dialect: Dialect,
 ) -> Optional[sqlglot_exp.Func]:
-    """Unwrap a PostgreSQL `pg_catalog.<fn>(...)` (with optional `FILTER`) AST node.
+    """Unwrap a PostgreSQL `pg_catalog.<fn>(...)` (with optional `FILTER` /
+    `IGNORE NULLS` / `RESPECT NULLS`) AST node.
 
     Handles both `Dot(this=Identifier('pg_catalog'), expression=fn)` and the
     `Column(this=Filter(this=fn, ...), table=Identifier('pg_catalog'))` shape
@@ -1736,12 +1737,13 @@ def _unwrap_pg_catalog_agg_node(
     """
     if Dialect(dialect) != Dialect.POSTGRES:
         return None
+    _wrappers = (sqlglot_exp.Filter, sqlglot_exp.IgnoreNulls, sqlglot_exp.RespectNulls)
     cur: sqlglot_exp.Expr = node
-    if isinstance(cur, sqlglot_exp.Filter):
+    while isinstance(cur, _wrappers) and isinstance(cur.this, sqlglot_exp.Expr):
         cur = cur.this
     if isinstance(cur, sqlglot_exp.Dot) and _is_pg_catalog_ast_ident(cur.this):
         fn = cur.expression
-        if isinstance(fn, sqlglot_exp.Filter):
+        while isinstance(fn, _wrappers) and isinstance(fn.this, sqlglot_exp.Expr):
             fn = fn.this
         if isinstance(fn, (sqlglot_exp.AggFunc, sqlglot_exp.Func)):
             if isinstance(fn, sqlglot_exp.Anonymous) and isinstance(fn.this, str):
@@ -1756,13 +1758,15 @@ def _unwrap_pg_catalog_agg_node(
         and _is_pg_catalog_ast_ident(cur.args.get("table"))
         and not cur.args.get("db")
         and not cur.args.get("catalog")
-        and isinstance(cur.this, sqlglot_exp.Filter)
-        and isinstance(cur.this.this, (sqlglot_exp.AggFunc, sqlglot_exp.Func))
+        and isinstance(cur.this, _wrappers)
     ):
-        fn = cur.this.this
-        if isinstance(fn, sqlglot_exp.Anonymous) and fn.sql("postgres").startswith('"') and fn.name != fn.name.lower():
-            return None
-        return fn
+        fn = cur.this
+        while isinstance(fn, _wrappers) and isinstance(fn.this, sqlglot_exp.Expr):
+            fn = fn.this
+        if isinstance(fn, (sqlglot_exp.AggFunc, sqlglot_exp.Func)):
+            if isinstance(fn, sqlglot_exp.Anonymous) and fn.sql("postgres").startswith('"') and fn.name != fn.name.lower():
+                return None
+            return fn
     return None
 
 
