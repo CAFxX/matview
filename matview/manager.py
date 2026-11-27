@@ -1927,13 +1927,13 @@ class MaterializedViewManager:
 
     # Bounded retries for a non-snapshot pk-range batch chosen as a deadlock /
     # serialization victim by the engine while independent writers run.
-    _BACKFILL_TRANSIENT_RETRIES = 8
+    _BACKFILL_TRANSIENT_RETRIES = 20
     # Bounded exponential backoff with jitter between those retries. Retrying
     # immediately re-collides with the same still-running writer transactions;
     # waiting lets them commit or be replayed. Sleep and RNG are injectable
     # (instance attributes) so tests are fast and exact.
-    _BACKFILL_RETRY_BASE_DELAY_S = 0.02
-    _BACKFILL_RETRY_MAX_DELAY_S = 1.0
+    _BACKFILL_RETRY_BASE_DELAY_S = 0.01
+    _BACKFILL_RETRY_MAX_DELAY_S = 0.25
     _backfill_sleep = staticmethod(time.sleep)
     _backfill_rng: Any = random.Random()
     _backfill_watermark_claimed = False
