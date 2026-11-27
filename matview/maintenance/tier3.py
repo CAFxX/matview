@@ -150,7 +150,7 @@ class Tier3Mixin(MixinHost):
                 return expanded_bs, arm_tree
             return None
 
-        col_types_by_lower: Dict[str, str] = {}
+        col_types_by_pos: List[str] = []
         if len(self.view.select_items) == 1 and self.view.select_items[0].raw_expr.strip() == "*":
             setop_star_done = False
             try:
@@ -168,7 +168,7 @@ class Tier3Mixin(MixinHost):
                         dt = m_ctx.primary_schema.columns[fb_it.alias].data_type
                         if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and fb_it.alias.lower() in indexed_cols_lower:
                             dt = "VARCHAR(255)"
-                        col_types_by_lower[fb_it.alias.lower()] = dt
+                        col_types_by_pos.append(dt)
                         col_defs_sql.append(f"{self._q(fb_it.alias)} {dt}")
                     setop_star_done = True
             if not setop_star_done:
@@ -181,7 +181,7 @@ class Tier3Mixin(MixinHost):
                                 dt = "BLOB" if self.dialect == Dialect.SQLITE else self._normalize_dialect_type(c_def.data_type)
                                 if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
                                     dt = "VARCHAR(255)"
-                                col_types_by_lower[c_def.name.lower()] = dt
+                                col_types_by_pos.append(dt)
                                 col_defs_sql.append(f"{self._q(c_def.name)} {dt}")
                 if not user_columns and self.primary_schema:
                     for c_def in self.primary_schema.columns.values():
@@ -189,7 +189,7 @@ class Tier3Mixin(MixinHost):
                         dt = "BLOB" if self.dialect == Dialect.SQLITE else self._normalize_dialect_type(c_def.data_type)
                         if self.dialect == Dialect.MYSQL and dt.upper() == "TEXT" and c_def.name.lower() in indexed_cols_lower:
                             dt = "VARCHAR(255)"
-                        col_types_by_lower[c_def.name.lower()] = dt
+                        col_types_by_pos.append(dt)
                         col_defs_sql.append(f"{self._q(c_def.name)} {dt}")
         else:
             # For top-level compound set operations (e.g. UNION ALL ... ORDER BY / LIMIT,
@@ -224,7 +224,7 @@ class Tier3Mixin(MixinHost):
                     col_type = self._infer_expr_storage_type(item)
                 if self.dialect == Dialect.MYSQL and col_type.upper() == "TEXT" and item.alias.lower() in indexed_cols_lower:
                     col_type = "VARCHAR(255)"
-                col_types_by_lower[item.alias.lower()] = col_type
+                col_types_by_pos.append(col_type)
                 col_defs_sql.append(f"{self._q(item.alias)} {col_type}")
 
         index_ddls, index_names = self._build_all_index_ddls(
@@ -260,7 +260,7 @@ class Tier3Mixin(MixinHost):
         initial_populate_sql = f"INSERT INTO {mv_table} ({cols_csv})\n{raw_query};"
 
         ord_t3 = ", ".join(
-            self._pg_offset_order_expr(c, col_types_by_lower.get(c.lower(), ""), k)
+            self._pg_offset_order_expr(c, col_types_by_pos[k - 1] if k - 1 < len(col_types_by_pos) else "", k)
             for k, c in enumerate(user_columns, start=1)
         )
         inc_spec = IncrementalBackfillSpec(

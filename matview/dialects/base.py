@@ -2629,7 +2629,7 @@ class DialectBaseMixin(MixinHost):
                 if win_t is not None:
                     if self.dialect == Dialect.SQLITE and win_t.upper() == "BLOB":
                         return "BLOB"
-                    return canonical_type(win_t) or win_t
+                    return canonical_type(win_t) or (win_t if self.dialect == Dialect.POSTGRES else None)
                 return None
             if kind == "Cast":
                 target = node.args.get("to")
@@ -2934,7 +2934,7 @@ class DialectBaseMixin(MixinHost):
                                 self._infer_expr_storage_type_or_none(agg_item)
                                 or self._infer_expr_storage_type(agg_item)
                             )
-                            return canonical_type(agg_t) or agg_t
+                            return canonical_type(agg_t) or (agg_t if self.dialect == Dialect.POSTGRES else None)
                         if self.dialect == Dialect.POSTGRES:
                             routed_agg_t = self._aggregate_call_storage_type(pg_cat_fn)
                             if routed_agg_t is not None:
@@ -2972,7 +2972,7 @@ class DialectBaseMixin(MixinHost):
                         self._infer_expr_storage_type_or_none(agg_item)
                         or self._infer_expr_storage_type(agg_item)
                     )
-                    return canonical_type(agg_t) or agg_t
+                    return canonical_type(agg_t) or (agg_t if self.dialect == Dialect.POSTGRES else None)
                 if self.dialect == Dialect.POSTGRES:
                     routed_agg_t = self._aggregate_call_storage_type(node)
                     if routed_agg_t is not None:

@@ -1170,6 +1170,9 @@ class OfflineRoutingTests(unittest.TestCase):
 
         p_dup = self._plan("postgres", "SELECT g, json_agg(v ORDER BY id), json_agg(x ORDER BY id) FROM t GROUP BY g")
         self.assertEqual(p_dup.user_columns, ["g", "json_agg", "col_2"])
+        # Duplicate unaliased aggregates that also set source_col (SUM) deduplicate too.
+        p_dup_sum = self._plan("postgres", "SELECT g, SUM(v), SUM(h) FROM t GROUP BY g ORDER BY g")
+        self.assertEqual(p_dup_sum.user_columns, ["g", "sum", "col_2"])
 
         # Colliding later explicit aliases & reserved col_k names never duplicate.
         p_col_later = self._plan("postgres", "SELECT g, json_agg(v ORDER BY id), g AS json_agg FROM t GROUP BY g")
@@ -1182,7 +1185,7 @@ class OfflineRoutingTests(unittest.TestCase):
 
         # Infix operators that inherit from sqlglot_exp.Func must NOT steal
         # PostgreSQL's default function column name; pg_catalog.-qualified FILTER
-        # calls, comments, and quoted function names resolve cleanly.
+        # calls, comments, and parenthesized quoted function names resolve cleanly.
         p_op = self._plan("postgres", "SELECT id, lower(s) ~ 'a', lower(s) FROM t")
         self.assertEqual(p_op.user_columns, ["id", "col_1", "lower"])
         p_pgcat = self._plan(
@@ -1196,8 +1199,17 @@ class OfflineRoutingTests(unittest.TestCase):
         self.assertRegex(p_pgcat_aa.backing_table_ddl, r"\baa\s+INT\[\](?:\s|,|$)")
         p_dp = self._plan("postgres", "SELECT id, date_part('day', INTERVAL '3 days') FROM t")
         self.assertEqual(p_dp.user_columns, ["id", "date_part"])
-        p_quoted_fn = self._plan("postgres", 'SELECT g, "json_agg"(v ORDER BY id) FROM t GROUP BY g')
+        p_quoted_fn = self._plan("postgres", 'SELECT g, ("json_agg"(v ORDER BY id)) FROM t GROUP BY g')
         self.assertEqual(p_quoted_fn.user_columns, ["g", "json_agg"])
+        # Distinct case-only quoted aliases preserve positional backfill types.
+        p_case_alias = self._plan(
+            "postgres",
+            'SELECT g, json_agg(v ORDER BY id) AS "J-value", COUNT(*) AS "j-value" FROM t GROUP BY g',
+        )
+        self.assertIn(
+            'ROW(__mv_init."J-value")::pg_catalog.text',
+            p_case_alias.incremental_backfill_spec.offset_insert_template or "",
+        )
 
         # 2. Compound expressions over ARRAY_AGG / JSON_AGG / STRING_AGG keep exact
         #    PostgreSQL types instead of falling through to DOUBLE PRECISION.
@@ -1281,6 +1293,12 @@ class OfflineRoutingTests(unittest.TestCase):
             dialect="postgres",
         )
         self.assertRegex(p_coll_sub.backing_table_ddl, r'\ba\s+VARCHAR\s+COLLATE\s+"C"')
+        p_coll_coal = generate_materialized_view(
+            coll_schema,
+            "CREATE VIEW mv AS SELECT g, COALESCE(CAST(json_agg(s ORDER BY id) AS VARCHAR(8)), s) AS a FROM t GROUP BY g, s",
+            dialect="postgres",
+        )
+        self.assertRegex(p_coll_coal.backing_table_ddl, r'\ba\s+VARCHAR\(8\)\s+COLLATE\s+"C"')
 
         # 6. Non-btree types (XML, POINT, JSON[], JSONPATH) use ROW(...)::pg_catalog.text
         #    in offset_batch ORDER BY.

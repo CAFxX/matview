@@ -1240,6 +1240,7 @@ class Tier2Mixin(MixinHost):
 
         col_defs_sql: List[str] = []
         col_types_by_lower: Dict[str, str] = {}
+        col_types_by_pos: List[str] = []
         for it in self.view.select_items:
             if self.dialect == Dialect.SQLITE and (
                 (
@@ -1261,9 +1262,11 @@ class Tier2Mixin(MixinHost):
             if self.dialect == Dialect.MYSQL:
                 dt = dt + self._key_col_collate_suffix(it.raw_expr, dt)
             col_types_by_lower[it.alias.lower()] = dt
+            col_types_by_pos.append(dt)
             col_defs_sql.append(f"{self._q(it.alias)} {dt}")
         for mv_c, _, dt in hidden_grp_defs:
             col_types_by_lower[mv_c.lower()] = dt
+            col_types_by_pos.append(dt)
             col_defs_sql.append(f"{self._q(mv_c)} {dt}")
 
         backing_table_ddl = self._create_table_ddl(
@@ -1298,7 +1301,7 @@ class Tier2Mixin(MixinHost):
             f"SELECT {cols_csv} FROM (\n{source_query_sql}\n) AS __mv_init{pg_alias_list};"
         )
         ord_t2 = ", ".join(
-            self._pg_offset_order_expr(c, col_types_by_lower.get(c.lower(), ""), k)
+            self._pg_offset_order_expr(c, col_types_by_pos[k - 1] if k - 1 < len(col_types_by_pos) else "", k)
             for k, c in enumerate(target_cols, start=1)
         )
         inc_spec = IncrementalBackfillSpec(

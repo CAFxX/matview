@@ -922,7 +922,12 @@ class ExactAggregateRoutingMixin(MixinHost):
             if ok_all and resolved_args:
                 norms = {_norm_pg_t(t) for t in resolved_args}
                 if len(norms) == 1:
-                    return resolved_args[0]
+                    res = resolved_args[0]
+                    if self._pg_type_supports_collation(res):
+                        coal_coll = self._infer_pg_expr_collation(node.sql(dialect="postgres"))
+                        base_no_coll = re.sub(r"\s+COLLATE\s+.*$", "", res, flags=re.IGNORECASE).strip()
+                        res = f"{base_no_coll}{coal_coll}" if coal_coll else base_no_coll
+                    return res
         if isinstance(node, sqlglot_exp.Case):
             results = [i.args.get("true") for i in node.args.get("ifs") or ()] + [node.args.get("default")]
             types = {
