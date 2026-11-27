@@ -968,14 +968,143 @@ class OfflineRoutingTests(unittest.TestCase):
                         self.assertEqual([d.code for d in plan.strategy_diagnostics], ["ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"], shape)
 
     def test_window_aggregates_need_a_total_window_order(self) -> None:
+        # Order-sensitive window aggregates, tie-dependent window functions
+        # (ROW_NUMBER, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE),
+        # and non-whole-partition ROWS frames require a total order over the
+        # partition (PARTITION BY + ORDER BY covering every source PK); tie-
+        # independent windows (RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST,
+        # RANGE-framed or whole-partition aggregates) stay Tier 2.
         for expr, expected in (
             ("STRING_AGG(s, ',') OVER (PARTITION BY g)", T3),
             ("STRING_AGG(s, ',') OVER (PARTITION BY g ORDER BY s)", T3),
             ("STRING_AGG(s, ',') OVER (PARTITION BY g ORDER BY s, id)", T2),
             ("SUM(v) OVER (PARTITION BY g)", T2),
+            ("SUM(v) OVER (PARTITION BY g ORDER BY v)", T2),
+            ("SUM(v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)", T2),
+            ("SUM(v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)", T3),
+            ("SUM(v) OVER (PARTITION BY g ORDER BY v, id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)", T2),
+            ("COUNT(*) OVER (PARTITION BY g ORDER BY v ROWS 1 PRECEDING)", T3),
+            ("ROW_NUMBER() OVER (PARTITION BY g ORDER BY v)", T3),
+            ("ROW_NUMBER() OVER (PARTITION BY g)", T3),
+            ("ROW_NUMBER() OVER (PARTITION BY g ORDER BY v, id)", T2),
+            ("ROW_NUMBER() OVER (PARTITION BY id)", T2),
+            ("NTILE(4) OVER (PARTITION BY g ORDER BY v)", T3),
+            ("NTILE(4) OVER (PARTITION BY g ORDER BY v, id)", T2),
+            ("LAG(v) OVER (PARTITION BY g ORDER BY v)", T3),
+            ("LAG(v) OVER (PARTITION BY g ORDER BY v, id)", T2),
+            ("LEAD(v) OVER (PARTITION BY g ORDER BY v)", T3),
+            ("LEAD(v) OVER (PARTITION BY g ORDER BY v, id)", T2),
+            ("FIRST_VALUE(v) OVER (PARTITION BY g ORDER BY v)", T3),
+            ("FIRST_VALUE(v) IGNORE NULLS OVER (PARTITION BY g ORDER BY v)", T3),
+            ("FIRST_VALUE(v) OVER (PARTITION BY g ORDER BY v, id)", T2),
+            ("LAST_VALUE(v) OVER (PARTITION BY g ORDER BY v)", T3),
+            ("NTH_VALUE(v, 2) OVER (PARTITION BY g ORDER BY v)", T3),
+            ("NTH_VALUE(v, 2) OVER (PARTITION BY g ORDER BY v, id)", T2),
+            ("pg_catalog.string_agg(s, ',') OVER (PARTITION BY g)", T3),
+            ("pg_catalog.string_agg(s, ',') FILTER (WHERE v > 0) OVER (PARTITION BY g)", T3),
+            ("pg_catalog.array_agg(v) FILTER (WHERE v > 0) OVER (PARTITION BY g)", T3),
+            ("pg_catalog.json_agg(v) FILTER (WHERE v > 0) OVER (PARTITION BY g)", T3),
+            ("pg_catalog.any_value(v) OVER (PARTITION BY g)", T3),
+            ("pg_catalog.last_value(v) FILTER (WHERE v > 0) OVER (PARTITION BY g ORDER BY v)", T3),
+            ("pg_catalog.first_value(v) IGNORE NULLS OVER (PARTITION BY g ORDER BY v)", T3),
+            ("pg_catalog.lead(v) RESPECT NULLS OVER (PARTITION BY g ORDER BY v)", T3),
+            ("pg_catalog.row_number() OVER (PARTITION BY g ORDER BY v)", T3),
+            ("pg_catalog.row_number() OVER (PARTITION BY g ORDER BY v, id)", T2),
+            ("pg_catalog.ntile(3) OVER (PARTITION BY g ORDER BY v)", T3),
+            ("pg_catalog.ntile(3) OVER (PARTITION BY g ORDER BY v, id)", T2),
+            ("RANK() OVER (PARTITION BY g ORDER BY v)", T2),
+            ("DENSE_RANK() OVER (PARTITION BY g ORDER BY v)", T2),
+            ("PERCENT_RANK() OVER (PARTITION BY g ORDER BY v)", T2),
+            ("CUME_DIST() OVER (PARTITION BY g ORDER BY v)", T2),
         ):
             plan = self._plan("postgres", f"SELECT id, g, {expr} AS a FROM t")
             self.assertEqual(plan.strategy, expected, expr)
+            if expected == T3:
+                self.assertEqual(
+                    [d.code for d in plan.strategy_diagnostics],
+                    ["ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"],
+                    expr,
+                )
+        # PostgreSQL NTILE(n) and pg_catalog.ntile(n) return INTEGER (OID 23),
+        # while pg_catalog.row_number() returns BIGINT (OID 20).
+        p_ntile = self._plan(
+            "postgres",
+            "SELECT id, g, NTILE(3) OVER (PARTITION BY g ORDER BY v, id) AS nt, "
+            "pg_catalog.ntile(3) OVER (PARTITION BY g ORDER BY v, id) AS nt_pg, "
+            "pg_catalog.row_number() OVER (PARTITION BY g ORDER BY v, id) AS rn_pg FROM t",
+        )
+        self.assertEqual(p_ntile.strategy, T2)
+        p_ntile_ddl = p_ntile.backing_table_ddl
+        self.assertRegex(p_ntile_ddl, r'"?nt"?\s+INTEGER\b')
+        self.assertRegex(p_ntile_ddl, r'"?nt_pg"?\s+INTEGER\b')
+        self.assertRegex(p_ntile_ddl, r'"?rn_pg"?\s+BIGINT\b')
+        # GROUP BY pg_catalog.string_agg(s, ',') without ORDER BY also routes to Tier 3.
+        p_pgcat_grp = self._plan("postgres", "SELECT g, pg_catalog.string_agg(s, ',') AS sa FROM t GROUP BY g")
+        self.assertEqual(p_pgcat_grp.strategy, T3)
+        self.assertEqual([d.code for d in p_pgcat_grp.strategy_diagnostics], ["ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"])
+        # Opt-in AGGREGATE_ORDER_NOT_REPRODUCIBLE keeps tie-dependent windows on Tier 2
+        # and surfaces ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE in both strategy_diagnostics
+        # and plan.diagnostics.fallback_reason.
+        p_relaxed_win = generate_materialized_view(
+            parse_table_schema(self.SCHEMA, dialect="postgres"),
+            "CREATE VIEW mv AS SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t",
+            dialect="postgres",
+            accept_limitations=["AGGREGATE_ORDER_NOT_REPRODUCIBLE"],
+        )
+        self.assertEqual(p_relaxed_win.strategy, T2)
+        self.assertEqual(
+            [d.code for d in p_relaxed_win.strategy_diagnostics],
+            ["ORDER_SENSITIVE_RELAXED_GROUP_RECOMPUTE"],
+        )
+        self.assertIsNotNone(p_relaxed_win.diagnostics)
+        assert p_relaxed_win.diagnostics is not None and p_relaxed_win.diagnostics.fallback_reason is not None
+        self.assertIn("AGGREGATE_ORDER_NOT_REPRODUCIBLE", p_relaxed_win.diagnostics.fallback_reason)
+        # Composite PK (g, seq): PARTITION BY g ORDER BY seq covers the full PK -> Tier 2;
+        # PARTITION BY g ORDER BY v does not -> Tier 3.
+        comp_schema = parse_table_schema(
+            "CREATE TABLE tc (g INTEGER NOT NULL, seq INTEGER NOT NULL, v INTEGER, PRIMARY KEY (g, seq));",
+            dialect="postgres",
+        )
+        p_comp_ok = generate_materialized_view(
+            comp_schema,
+            "CREATE VIEW mv AS SELECT g, seq, ROW_NUMBER() OVER (PARTITION BY g ORDER BY seq) AS rn FROM tc",
+            dialect="postgres",
+        )
+        self.assertEqual(p_comp_ok.strategy, T2)
+        p_comp_tie = generate_materialized_view(
+            comp_schema,
+            "CREATE VIEW mv AS SELECT g, seq, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM tc",
+            dialect="postgres",
+        )
+        self.assertEqual(p_comp_tie.strategy, T3)
+        # Queries ineligible for Tier 2 window_partition keep FULL_REFRESH_FALLBACK
+        # rather than being hijacked by ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH.
+        for inelig_sql in (
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY v) AS rn FROM t",
+            "SELECT DISTINCT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t",
+            "SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t ORDER BY id",
+            "SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t GROUP BY id, g",
+        ):
+            p_inelig = self._plan("postgres", inelig_sql)
+            self.assertEqual(p_inelig.strategy, T3, inelig_sql)
+            self.assertEqual([d.code for d in p_inelig.strategy_diagnostics], ["FULL_REFRESH_FALLBACK"], inelig_sql)
+        # SQLite and MySQL apply the same tie-dependent window routing, and SQLite
+        # nullable INT PRIMARY KEY (non-rowid-alias) routes conservatively to Tier 3.
+        for dial in ("sqlite", "mysql"):
+            self.assertEqual(self._plan(dial, "SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t").strategy, T3, dial)
+            self.assertEqual(self._plan(dial, "SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v, id) AS rn FROM t").strategy, T2, dial)
+            self.assertEqual(self._plan(dial, "SELECT id, g, RANK() OVER (PARTITION BY g ORDER BY v) AS rk FROM t").strategy, T2, dial)
+        sqlite_nullable_pk = parse_table_schema(
+            "CREATE TABLE tnull (id INT PRIMARY KEY, g INT, v INT);",
+            dialect="sqlite",
+        )
+        p_sqlite_null = generate_materialized_view(
+            sqlite_nullable_pk,
+            "CREATE VIEW mv AS SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS rn FROM tnull",
+            dialect="sqlite",
+        )
+        self.assertEqual(p_sqlite_null.strategy, T3)
+        self.assertEqual([d.code for d in p_sqlite_null.strategy_diagnostics], ["ORDER_SENSITIVE_AGGREGATE_FULL_REFRESH"])
 
     def test_relaxed_opt_in_keeps_the_group_recompute(self) -> None:
         # Named exclusion from the exact differential: with the per-code

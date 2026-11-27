@@ -1059,6 +1059,56 @@ MUTANTS = (
         ),
     ),
     Mutant(
+        name="window-tie-dependent-funcs-not-routed",
+        source_path="matview/planner_exact_routing.py",
+        original="                if not (is_tie_dep_win_fn or has_rows_frame or is_order_sensitive_win_agg):",
+        replacement="                if not (has_rows_frame or is_order_sensitive_win_agg):",
+        target_test=(
+            "test_unrecognized_aggregates.OfflineRoutingTests."
+            "test_window_aggregates_need_a_total_window_order"
+        ),
+    ),
+    Mutant(
+        name="window-rows-frame-ties-not-routed",
+        source_path="matview/planner_exact_routing.py",
+        original="                    has_rows_frame = not is_whole_part",
+        replacement="                    has_rows_frame = False",
+        target_test=(
+            "test_unrecognized_aggregates.OfflineRoutingTests."
+            "test_window_aggregates_need_a_total_window_order"
+        ),
+    ),
+    Mutant(
+        name="window-partition-pk-omitted-from-total-order",
+        source_path="matview/planner_exact_routing.py",
+        original="                total_keys = [*part_keys, *order_keys]",
+        replacement="                total_keys = list(order_keys)",
+        target_test=(
+            "test_unrecognized_aggregates.OfflineRoutingTests."
+            "test_window_aggregates_need_a_total_window_order"
+        ),
+    ),
+    Mutant(
+        name="window-pg-catalog-unwrap-omitted",
+        source_path="matview/planner_exact_routing.py",
+        original="                    unwrapped_pg = _unwrap_pg_catalog_agg_node(func, self.dialect)",
+        replacement="                    unwrapped_pg = None",
+        target_test=(
+            "test_unrecognized_aggregates.OfflineRoutingTests."
+            "test_window_aggregates_need_a_total_window_order"
+        ),
+    ),
+    Mutant(
+        name="window-ineligible-partition-hijacks-fallback",
+        source_path="matview/planner_exact_routing.py",
+        original="        if not self.view.has_window_func or self._extract_window_partition_keys() is None:",
+        replacement="        if not self.view.has_window_func:",
+        target_test=(
+            "test_unrecognized_aggregates.OfflineRoutingTests."
+            "test_window_aggregates_need_a_total_window_order"
+        ),
+    ),
+    Mutant(
         name="mariadb-keyless-fk-guard-omitted",
         source_path="matview/dialects/emitters.py",
         original="                elif nullable_uniques or has_nonkey_skip:",

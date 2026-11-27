@@ -1617,14 +1617,36 @@ class DialectBaseMixin(MixinHost):
                 if ast_t is not None:
                     return ast_t
                 win_fn = inner.this
-                if isinstance(win_fn, sqlglot_exp.Filter) and win_fn.this is not None:
-                    win_fn = win_fn.this
-                if win_fn is not None and win_fn.__class__.__name__ in (
+                while isinstance(win_fn, sqlglot_exp.Expr):
+                    if isinstance(
+                        win_fn,
+                        (sqlglot_exp.Filter, sqlglot_exp.IgnoreNulls, sqlglot_exp.RespectNulls),
+                    ) and isinstance(win_fn.this, sqlglot_exp.Expr):
+                        win_fn = win_fn.this
+                        continue
+                    unwrapped_win = _unwrap_pg_catalog_agg_node(win_fn, self.dialect)
+                    if unwrapped_win is not None and unwrapped_win is not win_fn:
+                        win_fn = unwrapped_win
+                        continue
+                    break
+                win_fn_name = (
+                    str(win_fn.name).upper()
+                    if isinstance(win_fn, sqlglot_exp.Anonymous)
+                    else (win_fn.__class__.__name__ if win_fn is not None else "")
+                )
+                if win_fn is not None and win_fn_name in ("Ntile", "NTILE") and self.dialect == Dialect.POSTGRES:
+                    return "INTEGER"
+                if win_fn is not None and win_fn_name in (
                     "RowNumber",
                     "Rank",
                     "DenseRank",
                     "Ntile",
                     "Count",
+                    "ROW_NUMBER",
+                    "RANK",
+                    "DENSE_RANK",
+                    "NTILE",
+                    "COUNT",
                 ):
                     return self._int_type()
                 return None
@@ -1666,6 +1688,8 @@ class DialectBaseMixin(MixinHost):
                     return br_ctx._infer_expr_storage_type_or_none(agg_item) or br_ctx._infer_expr_storage_type(agg_item)
             if isinstance(inner, (sqlglot_exp.AggFunc, sqlglot_exp.Func, sqlglot_exp.Anonymous)):
                 fn_up = (inner.sql_name().upper() if hasattr(inner, "sql_name") else "") or inner.name.upper()
+                if fn_up == "NTILE" and self.dialect == Dialect.POSTGRES:
+                    return "INTEGER"
                 if fn_up in ("COUNT", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "BIT_AND", "BIT_OR", "BIT_XOR", "BITWISEANDAGG", "BITWISEORAGG", "BITWISEXORAGG", "BOOL_AND", "BOOL_OR", "LOGICALAND", "LOGICALOR"):
                     return self._int_type()
                 if fn_up in ("SUM", "TOTAL", "AVG", "VAR_POP", "VARIANCE", "VARIANCE_POP", "VARIANCEPOP", "VAR_SAMP", "VARSAMP", "STDDEV_POP", "STDDEV", "STD", "STDDEV_SAMP", "STDDEVSAMP"):
@@ -2600,16 +2624,35 @@ class DialectBaseMixin(MixinHost):
                 return "BIGINT" if (left_t in ranks and right_t in ranks) else None
             if kind == "Window":
                 inner = node.this
-                if isinstance(inner, sqlglot_exp.Filter) and inner.this is not None:
-                    inner = inner.this
+                while isinstance(inner, sqlglot_exp.Expr):
+                    if isinstance(
+                        inner,
+                        (sqlglot_exp.Filter, sqlglot_exp.IgnoreNulls, sqlglot_exp.RespectNulls),
+                    ) and isinstance(inner.this, sqlglot_exp.Expr):
+                        inner = inner.this
+                        continue
+                    unwrapped_win = _unwrap_pg_catalog_agg_node(inner, self.dialect)
+                    if unwrapped_win is not None and unwrapped_win is not inner:
+                        inner = unwrapped_win
+                        continue
+                    break
                 inner_kind = inner.__class__.__name__ if inner is not None else ""
-                if inner_kind in ("RowNumber", "Rank", "DenseRank", "Ntile", "Count"):
+                inner_anon = str(inner.name).upper() if isinstance(inner, sqlglot_exp.Anonymous) else ""
+                if (inner_kind == "Ntile" or inner_anon == "NTILE") and self.dialect == Dialect.POSTGRES:
+                    return "INTEGER"
+                if inner_kind in ("RowNumber", "Rank", "DenseRank", "Ntile", "Count") or inner_anon in (
+                    "ROW_NUMBER",
+                    "RANK",
+                    "DENSE_RANK",
+                    "NTILE",
+                    "COUNT",
+                ):
                     return "BIGINT"
-                if inner_kind in ("PercentRank", "CumeDist"):
+                if inner_kind in ("PercentRank", "CumeDist") or inner_anon in ("PERCENT_RANK", "CUME_DIST"):
                     return "DOUBLE PRECISION"
                 if inner is not None and (
                     inner_kind in ("Lag", "Lead", "FirstValue", "LastValue", "NthValue", "AnyValue")
-                    or (inner_kind == "Anonymous" and inner.name.upper() == "ANY_VALUE")
+                    or inner_anon in ("LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE", "ANY_VALUE")
                 ):
                     arg_n = (
                         inner.expressions[0]
@@ -2617,8 +2660,12 @@ class DialectBaseMixin(MixinHost):
                         else inner.this
                     )
                     base_t = infer(arg_n)
-                    if inner_kind in ("Lag", "Lead"):
-                        def_node = inner.args.get("default")
+                    if inner_kind in ("Lag", "Lead") or inner_anon in ("LAG", "LEAD"):
+                        def_node = (
+                            inner.expressions[2]
+                            if inner_kind == "Anonymous" and len(inner.expressions) >= 3
+                            else inner.args.get("default")
+                        )
                         if def_node is not None and not isinstance(def_node, sqlglot_exp.Null):
                             def_t = infer(def_node)
                             if base_t is None or def_t is None:
@@ -4109,17 +4156,19 @@ class DialectBaseMixin(MixinHost):
             return None
         if not isinstance(node, sqlglot_exp.Window) or node.this is None:
             return None
-        inner_node = node.this
-        if isinstance(inner_node, sqlglot_exp.Filter) and inner_node.this is not None:
-            inner_node = inner_node.this
-        if (
-            self.dialect == Dialect.POSTGRES
-            and isinstance(inner_node, sqlglot_exp.Dot)
-            and isinstance(inner_node.this, (sqlglot_exp.Identifier, sqlglot_exp.Column))
-            and inner_node.this.name.lower() == "pg_catalog"
-            and isinstance(inner_node.expression, sqlglot_exp.Expr)
-        ):
-            inner_node = inner_node.expression
+        inner_node: Optional[sqlglot_exp.Expr] = node.this
+        while isinstance(inner_node, sqlglot_exp.Expr):
+            if isinstance(
+                inner_node,
+                (sqlglot_exp.Filter, sqlglot_exp.IgnoreNulls, sqlglot_exp.RespectNulls),
+            ) and isinstance(inner_node.this, sqlglot_exp.Expr):
+                inner_node = inner_node.this
+                continue
+            unwrapped_win = _unwrap_pg_catalog_agg_node(inner_node, self.dialect)
+            if unwrapped_win is not None and unwrapped_win is not inner_node:
+                inner_node = unwrapped_win
+                continue
+            break
         inner_sql = node.this.sql(_sqlglot_dialect(self.dialect))
         agg_item = _parse_single_agg_expr(inner_sql, "__w", dialect=self.dialect)
         if agg_item is None or agg_item.agg_func is None:
@@ -4262,6 +4311,8 @@ class DialectBaseMixin(MixinHost):
                 num_branches = re.findall(r"\b(?:THEN|ELSE)\s+(-?\d+(?:\.\d+)?)\b", raw_u)
                 if num_branches:
                     return self._float_type() if any("." in nb for nb in num_branches) else self._int_type()
+            if self.dialect == Dialect.POSTGRES and re.match(r"^NTILE\s*\(", raw_u):
+                return "INTEGER"
             if re.match(r"^(?:ROW_NUMBER|RANK|DENSE_RANK|NTILE|COUNT|LENGTH|CHAR_LENGTH|INSTR)\s*\(", raw_u):
                 return self._int_type()
             if re.match(r"^(?:PERCENT_RANK|CUME_DIST|AVG|SUM|TOTAL|ROUND|ABS)\s*\(", raw_u):

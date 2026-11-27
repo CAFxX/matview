@@ -2219,8 +2219,12 @@ class PlannerMixin(MixinHost):
 
     def _diagnose_tier2_fallback(self) -> Tuple[str, str]:
         if self._alg_mode == "window_partition":
+            sel = "Tier 2 partition-scoped window maintenance: recomputes only the affected PARTITION BY partition(s)."
+            routing = self._exact_routing_fallback_for(MaintenanceStrategy.GROUP_SCOPED_DELTA)
+            if routing is not None:
+                return (sel, routing.message())
             return (
-                "Tier 2 partition-scoped window maintenance: recomputes only the affected PARTITION BY partition(s).",
+                sel,
                 "Window functions require recomputing sibling rows within the affected PARTITION BY partition rather than single-row O(1) deltas.",
             )
         sel = "Tier 2 group-scoped delta maintenance: recomputes only the affected GROUP BY groups."

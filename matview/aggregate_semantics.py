@@ -31,7 +31,10 @@ from sqlglot import exp
 KNOWN_AGGREGATE_NAMES = frozenset(
     {
         # PostgreSQL (pg_aggregate in pg_catalog, PG 18)
+        "ANY_VALUE",
         "ARRAY_AGG",
+        "GROUP_CONCAT",
+        "STRING_AGG",
         "JSON_AGG",
         "JSON_AGG_STRICT",
         "JSONB_AGG",
