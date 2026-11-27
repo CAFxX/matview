@@ -49,7 +49,7 @@ def _is_transient_lock_error(engine: Dialect, exc: BaseException) -> bool:
         code = getattr(exc, "errno", None)
         if code is None and getattr(exc, "args", None):
             code = exc.args[0]
-        return code in (1213, 1205)
+        return code in (1213, 1205, 1020)
     if engine == Dialect.POSTGRES:
         return (getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)) in ("40P01", "40001")
     return False
@@ -6411,6 +6411,598 @@ class TestMySqlIsolationLevelConcurrency(unittest.TestCase):
                 c.execute(f"DROP TABLE IF EXISTS {uq_tbl}")
                 admin.commit()
                 c.close()
+            except Exception:
+                pass
+            admin.close()
+
+
+class TestMySqlChunkedBackfillConcurrency(unittest.TestCase):
+    """Offline and native MySQL/MariaDB tests for chunked pk-range backfill
+    isolation, fail-closed locking, MariaDB 1020 retries, and multi-view
+    concurrent writers."""
+
+    def test_mysql_pk_range_batch_sets_repeatable_read_and_fails_closed_on_for_update_error(self) -> None:
+        from matview.manager import generate_materialized_view, parse_table_schema
+
+        schema = parse_table_schema(
+            "CREATE TABLE t (id INT PRIMARY KEY, g INT NOT NULL, k INT NOT NULL);",
+            dialect=Dialect.MYSQL,
+        )
+        plan = generate_materialized_view(
+            schema,
+            "CREATE VIEW v AS SELECT g, COUNT(*) AS n, SUM(k) AS sk FROM t GROUP BY g;",
+            dialect=Dialect.MYSQL,
+            ignore_limitations=True,
+            watermark_catalog_table="__matview_catalog",
+        )
+        spec = plan.incremental_backfill_spec
+        self.assertIsNotNone(spec)
+        assert spec is not None
+
+        # 1. Verify REPEATABLE READ is explicitly set before START TRANSACTION and FOR UPDATE.
+        executed: list[str] = []
+
+        class _FakeCur:
+            rowcount = 1
+
+            def execute(self, sql: str, params=None) -> None:
+                executed.append(sql)
+
+            def fetchall(self):
+                return [(1,), (2,)]
+
+            def fetchone(self):
+                return (1,)
+
+            def close(self) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        class _FakeConn:
+            def cursor(self):
+                return _FakeCur()
+
+            def commit(self) -> None:
+                executed.append("COMMIT")
+
+            def rollback(self) -> None:
+                executed.append("ROLLBACK")
+
+        mgr = MaterializedViewManager(
+            _FakeConn(),
+            dialect=Dialect.MYSQL,
+            skip_ensure_catalog=True,
+        )
+        mgr._backfill_owner_token = "tok1"
+        mgr._run_pk_range_batch(
+            _FakeCur(), plan, spec, "t", "id", 0, 10, 20, snapshot_isolation=False
+        )
+        self.assertIn("ROLLBACK", executed)
+        self.assertIn("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;", executed)
+        self.assertIn("START TRANSACTION;", executed)
+        idx_rb = executed.index("ROLLBACK")
+        idx_rr = executed.index("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+        idx_st = executed.index("START TRANSACTION;")
+        idx_fu = next(i for i, s in enumerate(executed) if "FOR UPDATE" in s)
+        self.assertLess(idx_rb, idx_rr)
+        self.assertLess(idx_rr, idx_st)
+        self.assertLess(idx_st, idx_fu)
+
+        # 1b. Single-shot backfill retry re-establishes REPEATABLE READ + START TRANSACTION
+        #     after a transient 1213 deadlock during _claim_backfill_watermark.
+        ss_executed: list[str] = []
+        claim_calls = [0]
+
+        class _Err1213(Exception):
+            errno = 1213
+
+        class _SingleShotRetryCur(_FakeCur):
+            def execute(self, sql: str, params=None) -> None:
+                ss_executed.append(sql)
+                if "UPDATE __matview_catalog" in sql and "backfill_cursor_pk IS NULL" in sql:
+                    claim_calls[0] += 1
+                    if claim_calls[0] == 1:
+                        raise _Err1213(1213, "Deadlock found when trying to get lock")
+
+        class _SingleShotConn(_FakeConn):
+            def cursor(self):
+                return _SingleShotRetryCur()
+
+            def commit(self) -> None:
+                ss_executed.append("COMMIT")
+
+            def rollback(self) -> None:
+                ss_executed.append("ROLLBACK")
+
+        ss_mgr = MaterializedViewManager(_SingleShotConn(), dialect=Dialect.MYSQL, skip_ensure_catalog=True)
+        ss_sleeps: list[float] = []
+        ss_mgr._backfill_sleep = ss_sleeps.append
+        ss_batches = ss_mgr._backfill_incrementally_with_cursor(
+            plan, batch_size=0, on_progress=None, snapshot_isolation=False, cur=_SingleShotRetryCur()
+        )
+        self.assertEqual(ss_batches, 1)
+        self.assertEqual(claim_calls[0], 2)
+        self.assertEqual(len(ss_sleeps), 1)
+        self.assertEqual(
+            ss_executed.count("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;"),
+            2,
+            f"retry did not re-establish REPEATABLE READ: {ss_executed!r}",
+        )
+        self.assertEqual(
+            ss_executed.count("START TRANSACTION;"),
+            2,
+            f"retry did not re-establish START TRANSACTION: {ss_executed!r}",
+        )
+
+        # 2. Verify a non-1213/1205 FOR UPDATE error (e.g. MariaDB 1020 or unexpected error)
+        #    is NOT swallowed (never falls through to fold the chunk unlocked).
+        fold_executed: list[str] = []
+
+        class _Err1020(Exception):
+            errno = 1020
+
+        class _FailingForUpdateCur(_FakeCur):
+            def execute(self, sql: str, params=None) -> None:
+                if "FOR UPDATE" in sql:
+                    raise _Err1020(1020, "Record has changed since last read")
+                if "INSERT INTO" in sql:
+                    fold_executed.append(sql)
+
+        with self.assertRaises(_Err1020):
+            mgr._run_pk_range_batch(
+                _FailingForUpdateCur(), plan, spec, "t", "id", 0, 10, 20, snapshot_isolation=False
+            )
+        self.assertEqual(fold_executed, [], "chunk fold must not execute after FOR UPDATE fails")
+
+    def test_mysql_pk_range_batch_retries_1020_on_chunk_but_fails_closed_on_catalog_takeover(self) -> None:
+        from matview.manager import generate_materialized_view, parse_table_schema
+
+        schema = parse_table_schema(
+            "CREATE TABLE t (id INT PRIMARY KEY, g INT NOT NULL, k INT NOT NULL);",
+            dialect=Dialect.MYSQL,
+        )
+        plan = generate_materialized_view(
+            schema,
+            "CREATE VIEW v AS SELECT g, COUNT(*) AS n, SUM(k) AS sk FROM t GROUP BY g;",
+            dialect=Dialect.MYSQL,
+            ignore_limitations=True,
+            watermark_catalog_table="__matview_catalog",
+        )
+
+        class _Err1020(Exception):
+            errno = 1020
+
+        # Case A: 1020 during backing-store chunk fold retries and succeeds.
+        chunk_attempts = [0]
+        rollbacks = [0]
+
+        class _Chunk1020Cur:
+            rowcount = 1
+            _last_sql = ""
+
+            def execute(self, sql: str, params=None) -> None:
+                self._last_sql = sql
+                if "INSERT INTO" in sql and "__matview_store_" in sql:
+                    chunk_attempts[0] += 1
+                    if chunk_attempts[0] == 1:
+                        raise _Err1020(1020, "Record has changed since last read in table '__matview_store_v'")
+
+            def fetchone(self):
+                if "MIN(" in self._last_sql:
+                    return (1, 5)
+                return ("v",)
+
+            def fetchall(self):
+                return [(1,)]
+
+            def close(self) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        class _Conn:
+            def __init__(self, cur_cls):
+                self._cur_cls = cur_cls
+
+            def cursor(self):
+                return self._cur_cls()
+
+            def commit(self) -> None:
+                pass
+
+            def rollback(self) -> None:
+                rollbacks[0] += 1
+
+        mgr = MaterializedViewManager(_Conn(_Chunk1020Cur), dialect=Dialect.MYSQL, skip_ensure_catalog=True)
+        sleeps: list[float] = []
+        mgr._backfill_sleep = sleeps.append
+        try:
+            batches = mgr._backfill_incrementally_with_cursor(
+                plan, batch_size=10, on_progress=None, snapshot_isolation=False, cur=_Chunk1020Cur()
+            )
+        except _Err1020 as exc:
+            self.fail(f"transient 1020 on backing store was not retried: {exc!r}")
+        self.assertEqual(batches, 1)
+        self.assertEqual(chunk_attempts[0], 2)
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(rollbacks[0], 1, "failed chunk must roll back before retrying")
+
+        # Case B: 1020 during catalog watermark advance STILL raises BackfillInterruptedError immediately.
+        class _CatalogTakeoverCur(_Chunk1020Cur):
+            def execute(self, sql: str, params=None) -> None:
+                self._last_sql = sql
+                if "UPDATE __matview_catalog" in sql and "backfill_owner =" in sql:
+                    raise _Err1020(1020, "Record has changed since last read in table '__matview_catalog'")
+
+        rollbacks_before_b = rollbacks[0]
+        mgr2 = MaterializedViewManager(_Conn(_CatalogTakeoverCur), dialect=Dialect.MYSQL, skip_ensure_catalog=True)
+        sleeps2: list[float] = []
+        mgr2._backfill_sleep = sleeps2.append
+        with self.assertRaises(BackfillInterruptedError):
+            mgr2._backfill_incrementally_with_cursor(
+                plan, batch_size=10, on_progress=None, snapshot_isolation=False, cur=_CatalogTakeoverCur()
+            )
+        self.assertEqual(sleeps2, [], "catalog takeover 1020 must fail closed without retrying")
+        self.assertGreaterEqual(rollbacks[0] - rollbacks_before_b, 1, "catalog takeover must roll back batch")
+
+    def _connect_mysql(self, dsn: str, *, read_committed: bool = False, snap_iso_off: bool = False):
+        import pymysql
+
+        p = urlparse(dsn)
+        c = pymysql.connect(
+            host=p.hostname or "127.0.0.1",
+            port=p.port or 3306,
+            user=p.username or "root",
+            password=p.password or "",
+            database=p.path.lstrip("/") or None,
+            autocommit=False,
+        )
+        cur = c.cursor()
+        cur.execute("SET SESSION innodb_lock_wait_timeout = 10")
+        if read_committed:
+            cur.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        if snap_iso_off:
+            try:
+                cur.execute("SET SESSION innodb_snapshot_isolation = OFF")
+            except Exception:
+                pass
+        c.commit()
+        cur.close()
+        return c
+
+    def test_native_mysql_rc_backfill_blocks_pk_gap_phantom_insert(self) -> None:
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN is not set; native MySQL/MariaDB test only")
+        from test_avg_concurrent_maintenance import _session_id, _wait_until_lock_waiting
+
+        tag = uuid.uuid4().hex[:8]
+        tbl = f"rc_gap_{tag}"
+        vname = f"v_rc_gap_{tag}"
+        # Both backfill connection AND writer connection run under READ COMMITTED.
+        bf_conn = self._connect_mysql(dsn, read_committed=True)
+        w_conn = self._connect_mysql(dsn, read_committed=True)
+        mon_conn = self._connect_mysql(dsn)
+        mgr = None
+        try:
+            cur = bf_conn.cursor()
+            cur.execute(f"CREATE TABLE {tbl} (id INT PRIMARY KEY, g INT NOT NULL, k INT NOT NULL) ENGINE=InnoDB")
+            cur.executemany(
+                f"INSERT INTO {tbl} VALUES (%s, %s, %s)",
+                [(i * 10, 1, 10) for i in range(1, 11)],
+            )
+            bf_conn.commit()
+            mgr = MaterializedViewManager(bf_conn, dialect=Dialect.MYSQL, ignore_limitations=True)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                plan = mgr.register_view(
+                    f"CREATE VIEW {vname} AS SELECT g, COUNT(*) AS n, SUM(k) AS sk FROM {tbl} GROUP BY g;",
+                    populate=False,
+                )
+            bf_sid = _session_id(Dialect.MYSQL, bf_conn)
+            w_sid = _session_id(Dialect.MYSQL, w_conn)
+            orig_adv = mgr._advance_backfill_watermark
+            writer_done = threading.Event()
+            writer_errors: list[BaseException] = []
+            writer_thread: list[threading.Thread] = []
+            saw_lock_wait = [False]
+
+            def _insert_into_gap() -> None:
+                wcur = None
+                try:
+                    wcur = w_conn.cursor()
+                    wcur.execute(f"INSERT INTO {tbl} VALUES (15, 1, 999)")
+                    w_conn.commit()
+                except BaseException as exc:
+                    writer_errors.append(exc)
+                finally:
+                    if wcur is not None:
+                        try:
+                            wcur.close()
+                        except Exception:
+                            pass
+                    writer_done.set()
+
+            def _hooked_adv(c, vn, cpk, upk, mpk, active):
+                if not writer_thread and cpk < 15 <= upk:
+                    th = threading.Thread(target=_insert_into_gap, daemon=True)
+                    writer_thread.append(th)
+                    th.start()
+                    # Positive lock-wait evidence: the gap INSERT into (cpk, upk]
+                    # MUST block on the chunk's REPEATABLE READ next-key lock
+                    # instead of slipping through as a phantom under READ COMMITTED.
+                    _wait_until_lock_waiting(
+                        Dialect.MYSQL, mon_conn, w_sid, writer_done, blocker_sid=bf_sid
+                    )
+                    saw_lock_wait[0] = True
+                return orig_adv(c, vn, cpk, upk, mpk, active)
+
+            mgr._advance_backfill_watermark = _hooked_adv
+            mgr.backfill_incrementally(plan, batch_size=20)
+            self.assertTrue(writer_thread, "gap insert hook did not fire")
+            writer_thread[0].join(timeout=15)
+            self.assertFalse(writer_thread[0].is_alive())
+            self.assertEqual(writer_errors, [])
+            self.assertTrue(saw_lock_wait[0], "gap insert did not wait on chunk range lock")
+
+            bf_conn.commit()
+            cur = bf_conn.cursor()
+            # Verify the session-level READ-COMMITTED isolation was preserved.
+            cur.execute("SELECT @@transaction_isolation")
+            self.assertEqual(str(cur.fetchone()[0]).upper().replace(" ", "-"), "READ-COMMITTED")
+            cur.execute(f"SELECT g, n, sk FROM {vname} ORDER BY g")
+            mv = cur.fetchall()
+            cur.execute(f"SELECT g, COUNT(*), SUM(k) FROM {tbl} GROUP BY g ORDER BY g")
+            live = cur.fetchall()
+            self.assertEqual(mv, live)
+            self.assertEqual(mv, ((1, 11, Decimal("1099")),))
+        finally:
+            if writer_thread and writer_thread[0].is_alive():
+                try:
+                    bf_conn.rollback()
+                except Exception:
+                    pass
+                writer_thread[0].join(timeout=10)
+            for c in (w_conn, mon_conn):
+                try:
+                    c.rollback()
+                    c.close()
+                except Exception:
+                    pass
+            try:
+                bf_conn.rollback()
+                if mgr is not None:
+                    try:
+                        mgr.drop_view(vname)
+                    except Exception:
+                        bf_conn.rollback()
+                bf_conn.cursor().execute(f"DROP TABLE IF EXISTS {tbl}")
+                bf_conn.commit()
+            except Exception:
+                pass
+            bf_conn.close()
+
+    def test_native_mysql_multi_view_chunked_backfill_under_concurrent_writers(self) -> None:
+        """Native MySQL/MariaDB regression for multi-view chunked incremental
+        backfill on a table that already has another view's triggers, while 3
+        independent writers run mixed isolation levels (RR, RR with
+        innodb_snapshot_isolation=OFF on MariaDB, and READ COMMITTED) and mixed
+        DML (PK-gap INSERT, high-PK multi-row INSERT, multi-statement SELECT+UPDATE
+        group moves, PK-moving UPDATE IGNORE, DELETE, IODKU, REPLACE) while 3 views
+        backfill concurrently (including one READ COMMITTED backfill session) and a
+        5th view is registered with incremental_backfill=True mid-flight."""
+        import random as _random
+
+        dsn = os.environ.get("MYSQL_DSN")
+        if not dsn:
+            self.skipTest("MYSQL_DSN is not set; native MySQL/MariaDB test only")
+
+        tag = uuid.uuid4().hex[:8]
+        tbl = f"mvbf_{tag}"
+        v1, v2, v3, v4, v5 = f"v1_{tag}", f"v2_{tag}", f"v3_{tag}", f"v4_{tag}", f"v5_{tag}"
+        conns = []
+        conns_lock = threading.Lock()
+
+        def _mk(*, rc: bool = False, snap_off: bool = False):
+            c = self._connect_mysql(dsn, read_committed=rc, snap_iso_off=snap_off)
+            with conns_lock:
+                conns.append(c)
+            return c
+
+        admin = _mk()
+        mgr0 = None
+        try:
+            cur = admin.cursor()
+            cur.execute(
+                f"CREATE TABLE {tbl} ("
+                "id INT PRIMARY KEY, g INT NOT NULL, k INT NOT NULL, v INT NOT NULL, "
+                "INDEX idx_g_k (g, k)"
+                ") ENGINE=InnoDB"
+            )
+            cur.executemany(
+                f"INSERT INTO {tbl} VALUES (%s, %s, %s, %s)",
+                [(i * 4, i % 4, i % 13, i) for i in range(1, 121)],
+            )
+            admin.commit()
+
+            mgr0 = MaterializedViewManager(admin, dialect=Dialect.MYSQL, ignore_limitations=True)
+            v1_q = f"SELECT g, COUNT(*) AS n, SUM(k) AS sk, MIN(k) AS mn, MAX(k) AS mx FROM {tbl} GROUP BY g"
+            v2_q = f"SELECT g, COUNT(*) AS n, SUM(k) AS sk, AVG(k) AS ak FROM {tbl} GROUP BY g"
+            v3_q = f"SELECT id, g, k FROM {tbl} WHERE k > 3"
+            v4_q = f"SELECT g, COUNT(*) AS n, SUM(v) AS sv FROM {tbl} WHERE k >= 5 GROUP BY g"
+            v5_q = f"SELECT g, COUNT(*) AS n, SUM(k) AS sk FROM {tbl} GROUP BY g"
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                mgr0.register_view(f"CREATE VIEW {v1} AS {v1_q};", incremental_backfill=True, batch_size=25)
+                p2 = mgr0.register_view(f"CREATE VIEW {v2} AS {v2_q};", populate=False)
+                p3 = mgr0.register_view(f"CREATE VIEW {v3} AS {v3_q};", populate=False)
+                p4 = mgr0.register_view(f"CREATE VIEW {v4} AS {v4_q};", populate=False)
+
+            writers_ready = threading.Barrier(4)
+            stop = threading.Event()
+            backfill_done = threading.Event()
+            errors: list[tuple[str, BaseException]] = []
+            err_lock = threading.Lock()
+            overlap_ops = [0, 0, 0]
+
+            def _writer(wid: int) -> None:
+                wc = _mk(rc=(wid == 2), snap_off=(wid == 1))
+                wcur = wc.cursor()
+                rng = _random.Random(9000 + wid)
+                next_hi = 2000 + wid * 1000
+                try:
+                    writers_ready.wait(timeout=20)
+                    while not stop.is_set():
+                        succeeded = False
+                        last_exc: BaseException | None = None
+                        for _ in range(40):
+                            try:
+                                r = rng.random()
+                                if r < 0.22:
+                                    wcur.execute(
+                                        f"INSERT IGNORE INTO {tbl} VALUES (%s, %s, %s, %s)",
+                                        (rng.randint(1, 480), rng.randint(0, 3), rng.randint(1, 15), rng.randint(1, 100)),
+                                    )
+                                elif r < 0.40:
+                                    next_hi += 2
+                                    wcur.execute(
+                                        f"INSERT INTO {tbl} VALUES (%s, %s, %s, %s), (%s, %s, %s, %s)",
+                                        (
+                                            next_hi - 1, rng.randint(0, 3), rng.randint(1, 15), rng.randint(1, 100),
+                                            next_hi, rng.randint(0, 3), rng.randint(1, 15), rng.randint(1, 100),
+                                        ),
+                                    )
+                                elif r < 0.60:
+                                    # Multi-statement SELECT + UPDATE (group move).
+                                    wcur.execute(f"SELECT COUNT(*) FROM {tbl}")
+                                    wcur.fetchall()
+                                    wcur.execute(
+                                        f"UPDATE {tbl} SET g = %s, k = %s WHERE id = %s",
+                                        (rng.randint(0, 3), rng.randint(1, 15), rng.randint(1, 480)),
+                                    )
+                                elif r < 0.74:
+                                    wcur.execute(
+                                        f"UPDATE IGNORE {tbl} SET id = %s WHERE id = %s",
+                                        (rng.randint(1, 560), rng.randint(1, 480)),
+                                    )
+                                elif r < 0.84:
+                                    wcur.execute(
+                                        f"INSERT INTO {tbl} VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE k = k + 1",
+                                        (rng.randint(1, 480), rng.randint(0, 3), 5, 5),
+                                    )
+                                elif r < 0.92:
+                                    wcur.execute(
+                                        f"REPLACE INTO {tbl} VALUES (%s, %s, %s, %s)",
+                                        (rng.randint(1, 480), rng.randint(0, 3), rng.randint(1, 15), 7),
+                                    )
+                                else:
+                                    wcur.execute(f"DELETE FROM {tbl} WHERE id = %s", (rng.randint(1, 480),))
+                                wc.commit()
+                                if not backfill_done.is_set():
+                                    overlap_ops[wid] += 1
+                                succeeded = True
+                                break
+                            except Exception as exc:
+                                last_exc = exc
+                                wc.rollback()
+                                if _is_transient_lock_error(Dialect.MYSQL, exc):
+                                    time.sleep(0.002)
+                                    continue
+                                raise
+                        if not succeeded and last_exc is not None:
+                            raise RuntimeError(f"writer-{wid} exhausted 40 retries: {last_exc!r}") from last_exc
+                except BaseException as exc:
+                    writers_ready.abort()
+                    with err_lock:
+                        errors.append((f"writer-{wid}", exc))
+                finally:
+                    try:
+                        wcur.close()
+                    except Exception:
+                        pass
+
+            def _bf(name: str, plan, rc_bf: bool) -> None:
+                bc = _mk(rc=rc_bf)
+                bmgr = MaterializedViewManager(bc, dialect=Dialect.MYSQL, ignore_limitations=True)
+                try:
+                    bmgr.backfill_incrementally(plan, batch_size=20)
+                except BaseException as exc:
+                    with err_lock:
+                        errors.append((name, exc))
+
+            wths = [threading.Thread(target=_writer, args=(i,), daemon=True) for i in range(3)]
+            for th in wths:
+                th.start()
+            writers_ready.wait(timeout=20)
+            bths = [
+                threading.Thread(target=_bf, args=("bf_v2", p2, False), daemon=True),
+                threading.Thread(target=_bf, args=("bf_v3", p3, False), daemon=True),
+                threading.Thread(target=_bf, args=("bf_v4_rc", p4, True), daemon=True),
+            ]
+            for th in bths:
+                th.start()
+            for th in bths:
+                th.join(timeout=60)
+            # Also register and incrementally backfill a 5th view end-to-end while
+            # all 3 writers are actively running (pre-claim + claim + chunked fold).
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EngineLimitationWarning)
+                mgr0.register_view(f"CREATE VIEW {v5} AS {v5_q};", incremental_backfill=True, batch_size=20)
+            backfill_done.set()
+            stop.set()
+            for th in wths:
+                th.join(timeout=30)
+
+            self.assertFalse([th for th in bths + wths if th.is_alive()], "worker/backfill thread hung")
+            self.assertEqual(errors, [], f"unexpected errors: {errors!r}")
+            self.assertTrue(all(c > 0 for c in overlap_ops), f"writers did not overlap backfill: {overlap_ops!r}")
+
+            admin.commit()
+            cur = admin.cursor()
+            for vn, q in (
+                (v1, f"{v1_q} ORDER BY g"),
+                (v2, f"{v2_q} ORDER BY g"),
+                (v3, f"{v3_q} ORDER BY id"),
+                (v4, f"{v4_q} ORDER BY g"),
+                (v5, f"{v5_q} ORDER BY g"),
+            ):
+                cur.execute(f"SELECT * FROM {vn} ORDER BY 1")
+                mv = cur.fetchall()
+                cur.execute(q)
+                lv = cur.fetchall()
+                self.assertEqual(mv, lv, f"{vn} diverged from live view")
+                self.assertEqual(mgr0.get_catalog()[vn]["backfill_active"], 0)
+        finally:
+            stop.set()
+            writers_ready.abort()
+            for c in conns:
+                if c is admin:
+                    continue
+                try:
+                    c.rollback()
+                    c.close()
+                except Exception:
+                    pass
+            try:
+                admin.rollback()
+                if mgr0 is not None:
+                    for vn in (v5, v4, v3, v2, v1):
+                        try:
+                            mgr0.drop_view(vn)
+                        except Exception:
+                            admin.rollback()
+                admin.cursor().execute(f"DROP TABLE IF EXISTS {tbl}")
+                admin.commit()
             except Exception:
                 pass
             admin.close()
