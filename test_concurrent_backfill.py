@@ -6637,10 +6637,14 @@ class TestMySqlChunkedBackfillConcurrency(unittest.TestCase):
         self.assertGreaterEqual(rollbacks[0], 1, "failed chunk must roll back before retrying")
 
         # Case B: 1020 during catalog watermark advance STILL raises BackfillInterruptedError immediately.
+        case_b_chunk_folds = [0]
+
         class _CatalogTakeoverCur(_Chunk1020Cur):
             def execute(self, sql: str, params=None) -> None:
                 self._last_sql = sql
-                if "UPDATE __matview_catalog" in sql and "backfill_owner =" in sql:
+                if "INSERT INTO" in sql and "__matview_store_" in sql:
+                    case_b_chunk_folds[0] += 1
+                if "UPDATE __matview_catalog" in sql and "AND backfill_owner =" in sql:
                     raise _Err1020(1020, "Record has changed since last read in table '__matview_catalog'")
 
         rollbacks_before_b = rollbacks[0]
@@ -6651,6 +6655,7 @@ class TestMySqlChunkedBackfillConcurrency(unittest.TestCase):
             mgr2._backfill_incrementally_with_cursor(
                 plan, batch_size=10, on_progress=None, snapshot_isolation=False, cur=_CatalogTakeoverCur()
             )
+        self.assertEqual(case_b_chunk_folds[0], 1, "chunk fold must execute before catalog advancement failure")
         self.assertEqual(sleeps2, [], "catalog takeover 1020 must fail closed without retrying")
         self.assertGreaterEqual(rollbacks[0] - rollbacks_before_b, 1, "catalog takeover must roll back batch")
 
@@ -6693,6 +6698,7 @@ class TestMySqlChunkedBackfillConcurrency(unittest.TestCase):
         w_conn = self._connect_mysql(dsn, read_committed=True)
         mon_conn = self._connect_mysql(dsn)
         mgr = None
+        writer_thread: list[threading.Thread] = []
         try:
             cur = bf_conn.cursor()
             cur.execute(f"CREATE TABLE {tbl} (id INT PRIMARY KEY, g INT NOT NULL, k INT NOT NULL) ENGINE=InnoDB")
@@ -6713,7 +6719,6 @@ class TestMySqlChunkedBackfillConcurrency(unittest.TestCase):
             orig_adv = mgr._advance_backfill_watermark
             writer_done = threading.Event()
             writer_errors: list[BaseException] = []
-            writer_thread: list[threading.Thread] = []
             saw_lock_wait = [False]
 
             def _insert_into_gap() -> None:
@@ -6757,8 +6762,8 @@ class TestMySqlChunkedBackfillConcurrency(unittest.TestCase):
             bf_conn.commit()
             cur = bf_conn.cursor()
             # Verify the session-level READ-COMMITTED isolation was preserved.
-            cur.execute("SELECT @@transaction_isolation")
-            self.assertEqual(str(cur.fetchone()[0]).upper().replace(" ", "-"), "READ-COMMITTED")
+            iso = TestMySqlIsolationLevelConcurrency._read_session_isolation(cur)
+            self.assertEqual(iso.replace(" ", "-"), "READ-COMMITTED")
             cur.execute(f"SELECT g, n, sk FROM {vname} ORDER BY g")
             mv = cur.fetchall()
             cur.execute(f"SELECT g, COUNT(*), SUM(k) FROM {tbl} GROUP BY g ORDER BY g")
@@ -6820,6 +6825,8 @@ class TestMySqlChunkedBackfillConcurrency(unittest.TestCase):
 
         admin = _mk()
         mgr0 = None
+        writers_ready = threading.Barrier(4)
+        stop = threading.Event()
         try:
             cur = admin.cursor()
             cur.execute(
@@ -6848,8 +6855,6 @@ class TestMySqlChunkedBackfillConcurrency(unittest.TestCase):
                 p3 = mgr0.register_view(f"CREATE VIEW {v3} AS {v3_q};", populate=False)
                 p4 = mgr0.register_view(f"CREATE VIEW {v4} AS {v4_q};", populate=False)
 
-            writers_ready = threading.Barrier(4)
-            stop = threading.Event()
             backfill_done = threading.Event()
             errors: list[tuple[str, BaseException]] = []
             err_lock = threading.Lock()
@@ -6859,7 +6864,10 @@ class TestMySqlChunkedBackfillConcurrency(unittest.TestCase):
                 wc = _mk(rc=(wid == 2), snap_off=(wid == 1))
                 wcur = wc.cursor()
                 rng = _random.Random(9000 + wid)
-                next_hi = 2000 + wid * 1000
+                # Disjoint, dense PK sequences across all 3 writers (> 560) so
+                # high-throughput CI runners never collide and never create
+                # million-wide sparse PK gaps for chunked range backfill.
+                next_hi = 600 + wid * 2
                 try:
                     writers_ready.wait(timeout=20)
                     while not stop.is_set():
@@ -6874,14 +6882,15 @@ class TestMySqlChunkedBackfillConcurrency(unittest.TestCase):
                                         (rng.randint(1, 480), rng.randint(0, 3), rng.randint(1, 15), rng.randint(1, 100)),
                                     )
                                 elif r < 0.40:
-                                    next_hi += 2
+                                    id1, id2 = next_hi + 1, next_hi + 2
                                     wcur.execute(
                                         f"INSERT INTO {tbl} VALUES (%s, %s, %s, %s), (%s, %s, %s, %s)",
                                         (
-                                            next_hi - 1, rng.randint(0, 3), rng.randint(1, 15), rng.randint(1, 100),
-                                            next_hi, rng.randint(0, 3), rng.randint(1, 15), rng.randint(1, 100),
+                                            id1, rng.randint(0, 3), rng.randint(1, 15), rng.randint(1, 100),
+                                            id2, rng.randint(0, 3), rng.randint(1, 15), rng.randint(1, 100),
                                         ),
                                     )
+                                    next_hi += 6
                                 elif r < 0.60:
                                     # Multi-statement SELECT + UPDATE (group move).
                                     wcur.execute(f"SELECT COUNT(*) FROM {tbl}")
