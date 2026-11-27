@@ -1574,6 +1574,8 @@ class MaterializedViewManager:
                     if self.dialect == Dialect.POSTGRES:
                         cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
                     elif self.dialect == Dialect.MYSQL:
+                        if dbapi_transaction_state(self.conn) is True:
+                            self._rollback()
                         cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
                         cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT;")
                     elif self.dialect == Dialect.SQLITE:
@@ -1775,6 +1777,7 @@ class MaterializedViewManager:
     def _claim_backfill_watermark(
         self, cur: Any, view_name: str, cursor_pk: int, max_pk: int, active: int = 1,
         retry: bool = True,
+        on_retry_begin: Optional[Callable[[], None]] = None,
     ) -> None:
         """Atomically claim the pk-range watermark: only one backfill may own it.
 
@@ -1828,6 +1831,8 @@ class MaterializedViewManager:
                     ) from exc
                 attempt += 1
                 self._backfill_sleep(self._backfill_retry_delay(attempt))
+                if on_retry_begin is not None:
+                    on_retry_begin()
         claimed = getattr(cur, "rowcount", None)
         if claimed is None or claimed < 0:
             # Driver/adapter without a DML rowcount (all supported DB-API
@@ -2004,17 +2009,21 @@ class MaterializedViewManager:
                         if self._is_transient_lock_error(exc) or self._is_lock_timeout_error(exc):
                             raise
             elif self.dialect == Dialect.MYSQL:
+                # Explicitly force REPEATABLE READ for the batch transaction so
+                # SELECT ... FOR UPDATE acquires InnoDB next-key/gap locks on
+                # (cursor_pk, upper_pk] even when the session runs at READ COMMITTED
+                # (without gap locks, a concurrent INSERT into a PK gap inside the
+                # chunk range skips trigger maintenance and is missed by the fold).
+                # Fail closed on any FOR UPDATE error instead of folding unlocked.
+                self._rollback()
+                cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
                 cur.execute("START TRANSACTION;")
-                try:
-                    self._execute_param(
-                        cur,
-                        f"SELECT {pk_col} FROM {base_t} WHERE {pk_col} > ? AND {pk_col} <= ? FOR UPDATE",
-                        (cursor_pk, upper_pk),
-                    )
-                    cur.fetchall()
-                except Exception as exc:
-                    if self._is_transient_lock_error(exc):
-                        raise
+                self._execute_param(
+                    cur,
+                    f"SELECT {pk_col} FROM {base_t} WHERE {pk_col} > ? AND {pk_col} <= ? FOR UPDATE",
+                    (cursor_pk, upper_pk),
+                )
+                cur.fetchall()
             elif self.dialect == Dialect.SQLITE:
                 self._reserve_sqlite_writer(cur)
         for tmpl in spec.chunk_sql_templates:
@@ -2146,6 +2155,8 @@ class MaterializedViewManager:
             if pg_lock_targets:
                 cur.execute(f"LOCK TABLE {', '.join(pg_lock_targets)} IN SHARE MODE;")
         elif self.dialect == Dialect.MYSQL:
+            self._rollback()
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
             cur.execute("START TRANSACTION;")
 
     def _backfill_incrementally_with_cursor(
@@ -2167,6 +2178,11 @@ class MaterializedViewManager:
                 self._COMPLETED_MARKER_PK,
                 active=0,
                 retry=not snapshot_isolation,
+                on_retry_begin=(
+                    (lambda: self._begin_single_shot_backfill_tx(cur, plan))
+                    if not snapshot_isolation
+                    else None
+                ),
             )
             for s in plan.initial_populate_sqls:
                 cur.execute(s)
@@ -2255,6 +2271,12 @@ class MaterializedViewManager:
                                 # MySQL 1205: retry, never "taken over".
                                 or self._is_lock_timeout_error(exc)
                                 or self._is_concurrent_group_insert_error(exc)
+                                # MariaDB 11.6+ innodb_snapshot_isolation (1020)
+                                # on base_t or the backing store is a transient
+                                # serialization conflict (catalog takeovers were
+                                # already converted to BackfillInterruptedError
+                                # inside _advance_backfill_watermark).
+                                or self._is_snapshot_row_changed_error(exc)
                             )
                         ):
                             raise
@@ -2354,6 +2376,11 @@ class MaterializedViewManager:
             self._COMPLETED_MARKER_PK,
             active=0,
             retry=not snapshot_isolation,
+            on_retry_begin=(
+                (lambda: self._begin_single_shot_backfill_tx(cur, plan))
+                if not snapshot_isolation
+                else None
+            ),
         )
         for s in plan.initial_populate_sqls:
             cur.execute(s)

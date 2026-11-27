@@ -1069,6 +1069,46 @@ MUTANTS = (
         ),
     ),
     Mutant(
+        name="mysql-pk-range-batch-omits-repeatable-read",
+        source_path="matview/manager.py",
+        original='                self._rollback()\n                cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")\n                cur.execute("START TRANSACTION;")',
+        replacement='                cur.execute("START TRANSACTION;")',
+        target_test=(
+            "test_concurrent_backfill.TestMySqlChunkedBackfillConcurrency."
+            "test_mysql_pk_range_batch_sets_repeatable_read_and_fails_closed_on_for_update_error"
+        ),
+    ),
+    Mutant(
+        name="mysql-pk-range-batch-swallows-for-update-error",
+        source_path="matview/manager.py",
+        original='                self._execute_param(\n                    cur,\n                    f"SELECT {pk_col} FROM {base_t} WHERE {pk_col} > ? AND {pk_col} <= ? FOR UPDATE",\n                    (cursor_pk, upper_pk),\n                )\n                cur.fetchall()',
+        replacement='                try:\n                    self._execute_param(\n                        cur,\n                        f"SELECT {pk_col} FROM {base_t} WHERE {pk_col} > ? AND {pk_col} <= ? FOR UPDATE",\n                        (cursor_pk, upper_pk),\n                    )\n                    cur.fetchall()\n                except Exception as exc:\n                    if self._is_transient_lock_error(exc):\n                        raise',
+        target_test=(
+            "test_concurrent_backfill.TestMySqlChunkedBackfillConcurrency."
+            "test_mysql_pk_range_batch_sets_repeatable_read_and_fails_closed_on_for_update_error"
+        ),
+    ),
+    Mutant(
+        name="mysql-pk-range-batch-omits-1020-retry",
+        source_path="matview/manager.py",
+        original="                                or self._is_snapshot_row_changed_error(exc)",
+        replacement="                                or False",
+        target_test=(
+            "test_concurrent_backfill.TestMySqlChunkedBackfillConcurrency."
+            "test_mysql_pk_range_batch_retries_1020_on_chunk_but_fails_closed_on_catalog_takeover"
+        ),
+    ),
+    Mutant(
+        name="mysql-single-shot-claim-drops-tx-on-retry",
+        source_path="matview/manager.py",
+        original="                if on_retry_begin is not None:\n                    on_retry_begin()",
+        replacement="                if False and on_retry_begin is not None:\n                    on_retry_begin()",
+        target_test=(
+            "test_concurrent_backfill.TestMySqlChunkedBackfillConcurrency."
+            "test_mysql_pk_range_batch_sets_repeatable_read_and_fails_closed_on_for_update_error"
+        ),
+    ),
+    Mutant(
         name="mariadb-partitioned-guard-omitted",
         source_path="matview/dialects/emitters.py",
         original='            or getattr(t_schema, "is_partitioned", False)',
